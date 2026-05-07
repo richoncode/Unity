@@ -3,7 +3,84 @@
 Authoritative implementation plan for the stereo MR video player on Meta Quest 3.
 This file persists across context loss / sessions; treat as the source of truth.
 
-Last updated: 2026-05-06.
+Last updated: 2026-05-07.
+
+---
+
+## STATE AT HANDOFF — START HERE FOR A NEW SESSION
+
+**Repo:** `richoncode/Unity` (https://github.com/richoncode/Unity, public).
+**Local repo root:** `/Users/richardbailey/RichardClaude/Unity/` (the directory that contains this file's parent dir, `VibeUnity1/`).
+**Unity project:** `/Users/richardbailey/RichardClaude/Unity/VibeUnity1/` (Assets/, Packages/, ProjectSettings/ at this level).
+**Initial commit:** `b908bab` — captures everything below.
+
+### Current verified state on Quest 3 (post-reboot, clean Library/Bee, both OpenXR features enabled)
+
+| Configuration | Result | Run |
+|---|---|---|
+| No `[Compositor] StereoQuadPanel` GameObject in scene | ✅ alive | `STEREO_SKIP_PANEL=1` env var on AutoBuilder |
+| Panel uses **stock** `QuadLayerData` | ✅ alive | `STEREO_USE_STOCK_QUAD=1` env var on AutoBuilder |
+| Panel uses our **custom** `StereoQuadLayerData` | ❌ SIGSEGV in `Resources.FindObjectsOfTypeAll<CompositionLayer>` ~500 ms after launch | default build |
+
+This is the **single isolated failure mode** to focus on. The earlier "everything crashes" cascade-failures (URP `XRDisplaySubsystem.TryGetRenderPass` null, ShaderPropertySheet SEGV, etc.) were Quest 3 device-side state pollution from 60+ install/uninstall cycles in one session. **A device reboot cleared them.** Going forward: when test results stop matching expectations, reboot the Quest before chasing other hypotheses.
+
+### Bisect already ran — these did NOT fix the custom-LayerData crash
+
+- Empty subclass with no fields (`Provider="Quintar"`, no fields, all property accessors return constants)
+- Stock-clone subclass with `Provider="Unity"` and identical fields to `QuadLayerData`
+- Adding `[Preserve]` attribute on the class
+- `link.xml` `<assembly preserve="all"/>` for our asmdef
+- Custom struct (memory-identical to `XrCompositionLayerQuad`) to dodge `OpenXRCustomLayerHandler<T>` static-singleton conflict
+- Compiling our LayerData type but NOT registering our handler (so handler logic never runs)
+- Reverting texture importer overrides
+- Disabling all unrelated runtime spawners (`StereoVideoManager`, `CubeInteractionSetup`)
+
+The crash is specifically about a custom `LayerData` subclass *being present in the scene* with the framework enumerating it via `FindObjectsByType`. It is NOT about: handler logic, scene authoring approach, build cache state, or any field on the class. **A new architectural approach is needed; field-level bisecting is exhausted.**
+
+### Files reflecting current handoff state
+
+- `Assets/Scripts/StereoVideoCompositor/AlphaBlendFBExtension.cs` — `CompositionLayerExtension` subclass + `XrBlendFactorFB` enum + `XrCompositionLayerAlphaBlendFB` struct. Working.
+- `Assets/Scripts/StereoVideoCompositor/StereoCompositorFeature.cs` — `OpenXRFeature` subclass declaring `XR_FB_composition_layer_alpha_blend`. Registers our `StereoQuadLayerHandler` for `typeof(StereoQuadLayerData)` on `OpenXRLayerProvider.Started`. Day 1 verified working.
+- `Assets/Scripts/StereoVideoCompositor/StereoQuadLayerData.cs` — `LayerData` subclass with `[CompositionLayerData(SupportTransform=true)]`. **THIS is what triggers the crash when present in scene.**
+- `Assets/Scripts/StereoVideoCompositor/StereoQuadLayerHandler.cs` — `OpenXRCustomLayerHandler<XrCompositionLayerQuad>` subclass. Has architectural problem: shares static singleton with stock `OpenXRQuadLayer` (KeyNotFoundException per frame). **Replace with direct `ILayerHandler` implementation per the architect review.**
+- `Assets/Scripts/StereoVideoCompositor/Quintar.StereoVideoCompositor.asmdef` — references Unity.XR.OpenXR + Unity.XR.CompositionLayers + Unity.Collections by GUID, allowUnsafeCode=true.
+- `Assets/Scripts/StereoVideoCompositor/StereoCompositorSpawner.cs` — runtime spawner DISABLED (architect ruled runtime CompositionLayer creation unsafe; edit-time only).
+- `Assets/Editor/StereoCompositorBuildSetup.cs` — currently a no-op (only refreshes feature discovery). Earlier toggling of OpenXR features per build was found to mutate `OpenXR Package Settings.asset` in ways that destabilize XR init. Manual feature enabling via Unity Editor UI is now the recommended path. NOTE: AutoBuilder still calls this, which currently does nothing.
+- `Assets/Editor/StereoCompositorSceneSetup.cs` — edit-time scene authoring, called from `AutoBuilder.BuildAndroid`. Honors `STEREO_SKIP_PANEL=1` and `STEREO_USE_STOCK_QUAD=1` env vars for testing.
+- `Assets/Editor/AutoBuilder.cs` — single-button build script.
+- `Assets/Scripts/StereoVideoManager.cs` — legacy SurfaceTexture path. Class compiled, runtime spawner DISABLED.
+- `Assets/Scripts/CubeInteractionSetup.cs` — unrelated test cubes, runtime spawner DISABLED (its `new Material(null)` was poisoning URP earlier in the session, since fixed but spawner left disabled).
+- `Assets/Plugins/Android/ExoPlayerBridge.java` — current Java bridge using SurfaceTexture. Will need to be refactored to take a Surface directly once Day 3 unblocks.
+- `Assets/StereoCompositor/StereoTestPattern.png` — 1024×1024 RGBA32 red-top / blue-bottom test pattern. Imported with default settings (isReadable=false, no platform override).
+- `Assets/Scenes/MR_Passthrough_Scene.unity` — the active scene. Contains `[Compositor] StereoQuadPanel` GameObject when default build runs.
+
+### Native Spatial SDK reference (Kotlin) — get from user
+
+The user has the canonical native player code (`PanelSceneObject` + `LayerAlphaBlend` + `setClip`). It was pasted in chat history during the design phase but is NOT included in this repo. **Ask the user for the snippet** before designing any new approach — it shows the exact `srcColor=DST_ALPHA, dstColor=ONE_MINUS_SRC_ALPHA, srcAlpha=ZERO, dstAlpha=ONE` blend factors and the three-panel zIndex topology.
+
+### Verified diagnostic methods
+
+- **`adb shell screencap -p > /tmp/foo.png`** captures the Quest 3 display including compositor layers. Stereo (left+right halves). Use to verify panel renders correctly.
+- **`VrApi:` logcat lines** — `LCnt=N` is the number of compositor layers being submitted. Baseline (no panel): ~3. With single panel: ~5–6. With our intended 6-quad stereo split: would be ~9.
+- **`Crash detected: NATIVE_CRASH_REPORT, pid=N`** from `DiagnosticsCollectorService` is the most reliable crash signal in logcat. Don't rely on grepping for `signal 11` — it gets buffer-rolled.
+
+### adb gotcha
+
+The Mac has TWO adb installations: Homebrew `/opt/homebrew/bin/adb` and Unity's bundled `/Applications/Unity/Hub/Editor/6000.4.5f1/PlaybackEngines/AndroidPlayer/SDK/platform-tools/adb`. They fight for port 5037. Mid-test `install -r` and `screencap` calls silently fail. Either: kill all adb daemons and let one start fresh, or `export PATH="<unity-adb-path>:$PATH"` so only Unity's adb is on PATH.
+
+### Recommended next step for a new architect
+
+The bisect already ruled out field-level + attribute-level + handler-level fixes. Two paths remain:
+
+**(A) Implement `OpenXRLayerProvider.ILayerHandler` directly**, bypass `OpenXRCustomLayerHandler<T>` entirely. Estimate: 1–2 days. May or may not avoid the `FindObjectsByType` SEGV (which happens before our handler even fires). If the crash is in `CompositionLayerManager`'s enumeration of the GameObject regardless of handler choice, this won't help.
+
+**(B) Switch to OVROverlay** + composite mask × video in Unity (Vulkan compute / shader). Loses per-layer custom blend factors at the OpenXR runtime level, so the destination-alpha trick has to move from "compositor layer math" to "Unity shader pre-multiply mask alpha into video RGB before submitting one combined OVROverlay". Estimate: 2–3 days. Lower risk but lower fidelity (Unity render pass for video pixels = some quality loss vs. compositor-direct path).
+
+**(C) File a Unity bug** and wait. The crash signature (`Resources.FindObjectsOfTypeAll<CompositionLayer>` SEGV when a custom `LayerData` subclass via `[SerializeReference]` is present in the scene) is reproducible enough to file. Stack: `com.unity.xr.openxr@1.17.0 + com.unity.xr.compositionlayers@2.2.0 + Meta XR Core 201 + URP 17.4 + Unity 6000.4.5f1 + Quest 3 OS 203`.
+
+A fresh architect should evaluate (A) vs (B) given the user's tolerance for fidelity loss. (C) can run in parallel.
+
+---
 
 ## Goal
 

@@ -1,0 +1,18 @@
+{
+    "name": "Quintar.StereoVideoCompositor",
+    "rootNamespace": "Quintar.StereoVideoCompositor",
+    "references": [
+        "GUID:4847341ff46394e83bb78fbd0652937e",
+        "GUID:3f088b6c6874b1b49a97747d1259079a",
+        "GUID:e0cd26848372d4e5c891c569017e11f1"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

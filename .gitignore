@@ -1,0 +1,72 @@
+# =============================
+# Unity multi-project repo .gitignore
+# Patterns are NOT anchored to repo root — they match Unity-generated dirs
+# inside any project subfolder (e.g. VibeUnity1/Library/, FutureProject/Library/, ...).
+# =============================
+
+# Unity machine-local / regenerated dirs
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+[Uu]ser[Ss]ettings/
+.utmp/
+
+# Unity build leftovers
+*_BurstDebugInformation_DoNotShip/
+*_BackUpThisFolder_ButDontShipItWithYourGame/
+
+# Unity / IDE auto-generated solution + project files
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+*.tmp
+.vs/
+.vsconfig
+.idea/
+.gradle/
+sysinfo.txt
+
+# Build outputs (don't commit binaries; let CI / build server produce them)
+*.apk
+*.aab
+*.unitypackage
+*.app
+*.symbols.zip
+
+# Stereo compositor investigation logs / caches (generated during dev iterations)
+*.log
+log*.txt
+unity_pid_log*.txt
+runtime_log*.txt
+mono_crash.*.json
+log_dev*.txt
+log_pid*.txt
+log_recent.txt
+log_startup.txt
+logcat*.txt
+unity_tag*.txt
+features.json
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Claude Code agent state (per-project settings + scratch worktrees; not for sharing).
+# settings.local.json may contain user-specific permission rules; worktrees/ may hold
+# unrelated cloned repos used for parallel agent runs.
+.claude/

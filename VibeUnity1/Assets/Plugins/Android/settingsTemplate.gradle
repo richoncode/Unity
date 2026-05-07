@@ -1,0 +1,24 @@
+pluginManagement {
+    repositories {
+        **LOCAL_PRIVATEREPO**
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+    repositories {
+        **LOCAL_PRIVATEREPO**
+        google()
+        mavenCentral()
+        flatDir {
+            dirs 'unityLibrary/libs'
+        }
+        **REPOSITORY_SETTINGS_HERE**
+    }
+}
+
+include ':launcher', ':unityLibrary'
+**INCLUDES**

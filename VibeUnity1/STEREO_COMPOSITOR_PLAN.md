@@ -82,6 +82,106 @@ A fresh architect should evaluate (A) vs (B) given the user's tolerance for fide
 
 ---
 
+## FIRST ACTIONS FOR THE ARCHITECT (NEW SESSION)
+
+### Goal
+
+End-to-end: **masked stereo video with overlay canvas pixels** rendered on the Quest 3, matching the native Spatial SDK player's visual output as closely as the Unity stack permits. "Masked" = destination-alpha cutout from `AllStar_MidCourt_Jumbo10.png` (alpha defines visible region). "Stereo" = per-eye correct content from a top-bottom encoded HLS stream via ExoPlayer. "Overlay canvas pixels" = a third compositor / overlay layer drawn on top, optionally clipped per-eye via UV rects.
+
+### Step 1 — Review (don't write code yet)
+
+Before formulating any plan, read these in order:
+
+1. **This entire document, top to bottom.** Treat the "STATE AT HANDOFF" + "Bisect already ran" sections as the ground truth for what works and what doesn't. Do not re-run bisects that already concluded.
+
+2. **The native Kotlin reference snippet from the user.** Not in the repo — ask the user to paste it. Look for: `createVideoPanel`, `createMaskLayeredPanel`, `createOverlayLayeredPanel`, `videoMaskingAlphaBlend()`. These define the canonical zIndex topology, blend factors, stereo mode per panel, and `setClip` UV rects. Any Unity-side design must reproduce that math exactly (or document why it can't and what the fidelity cost is).
+
+3. **The relevant Unity SDK source.** Paths in the "Critical files (verified locations)" section. At minimum:
+   - `OpenXRLayerProvider.cs` (`ILayerHandler` interface)
+   - `OpenXRCustomLayerHandler.cs` (the base class that has the static-singleton problem)
+   - `OpenXRLayerUtility.cs` (`AddActiveLayersToEndFrame`, `CreateSwapchain`, `GetLayerAndroidSurfaceObject`)
+   - `OpenXRQuadLayer.cs` (stock handler, exemplar)
+   - `Samples~/CustomCompositionLayerFeature/CustomLayerHandler.cs` (sample)
+
+4. **The current project source under `Assets/Scripts/StereoVideoCompositor/`** — see "Files reflecting current handoff state" section above.
+
+### Step 2 — Decide a path
+
+Pick from (A), (B), or some hybrid you propose. Document the rationale in this file (append a new section). Specifically address:
+
+- Will the chosen path actually avoid the `FindObjectsByType` SEGV? Provide reasoning, not just hope.
+- Does the chosen path preserve the destination-alpha masking math `final.rgb = video.rgb * dst.a + dst.rgb * (1 − video.a)`? If not, what's the visual fidelity cost and is the user OK with it?
+- What are the milestones (incremental, testable steps) and the first one to ship?
+
+### Step 3 — Increment
+
+Produce an incremental plan. Each step should be testable on device in isolation. Aim for ~2-hour increments where possible.
+
+Suggested rhythm (the architect can override):
+
+1. Confirm baseline: build with `STEREO_SKIP_PANEL=1`, deploy, verify alive on device. Screenshot.
+2. Add ONE thing (e.g. a single OVROverlay quad with a static texture, or a single `ILayerHandler`-emitted layer).
+3. Verify visually via `adb shell screencap` — see "Verified diagnostic methods" + "Device-and-content positioning" below.
+4. Repeat: ExoPlayer surface → mask blend → stereo split → overlay layer → polish.
+
+Do NOT attempt the full 6-layer / 3-panel topology in one shot. Smallest viable visible result first, then add layers.
+
+### Device-and-content positioning (Quest 3 on a stand)
+
+The Quest 3 in this setup **sits stationary on a stand approximately 0.8 m off the floor** (head-not-being-worn mode). It is NOT being moved by a user during testing. This has implications:
+
+- **Where the panel needs to be in world space.** The OVRCameraRig's tracking-space origin is roughly co-located with the device. To be visible in `adb screencap`, the panel must be placed where the device's lenses are pointing. Common-sense default: parent the panel GameObject to `OVRCameraRig.trackingSpace` (or use `XrReferenceSpaceType.View` for head-locked) and position at local `(0, 0, 1.5)` — directly in front of the device, 1.5 m ahead, at roughly eye height. **Avoid world-space `(0, 1.5, 1.5)`** (the previous default) — it assumes a standing user with floor at Y=0, but here the device's eye height in world Y is ~0.8 m, so a Y=1.5 m panel ends up well above the device's view frustum and is invisible in screenshots.
+
+- **What the screencap will show.** `adb shell screencap -p > /tmp/foo.png` captures a stereo image (left + right halves) of whatever is in the device's current view. If the test panel isn't in the view direction, it won't be in the screencap regardless of whether it's actually rendering correctly. A "blank" screencap is NOT proof of failure — verify position first by also checking `VrApi: LCnt=N` in logcat (layer count >= baseline+1 means a layer IS being submitted, just maybe out of frame).
+
+- **Practical recipe for a visible test pattern.**
+  - Parent the `[Compositor] StereoQuadPanel` GameObject to `OVRCameraRig.trackingSpace` (find it in the scene; it's the standard `OVRCameraRig` prefab).
+  - Set local position to `(0, 0, 1.5)` and rotation `(0, 180, 0)` so the front face faces the device. Adjust Z if too close/far.
+  - The panel is then auto-positioned wherever the device is — no need for the device to be at any particular world location.
+  - **Existing `StereoCompositorSceneSetup.cs` currently uses world-space `(0, 1.5, 1.5)` — UPDATE IT.** Change to parent under `OVRCameraRig.trackingSpace` (or whatever the canonical Meta XR Core rig anchor is) and use local coords. Document the change in the architect's plan section.
+
+- **Screenshot workflow loop.**
+  ```bash
+  # 1. Build + install
+  /Applications/Unity/Hub/Editor/6000.4.5f1/Unity.app/Contents/MacOS/Unity \
+      -batchmode -nographics \
+      -projectPath /Users/richardbailey/RichardClaude/Unity/VibeUnity1 \
+      -executeMethod AutoBuilder.BuildAndroid \
+      -logFile /tmp/build.log
+  adb -s 2G0YC5ZGB405BG install -r /Users/richardbailey/RichardClaude/Unity/VibeUnity1/Builds/MR_Passthrough.apk
+
+  # 2. Force-stop, clear logcat, launch
+  adb -s 2G0YC5ZGB405BG shell am force-stop com.UnityTechnologies.com.unity.template.urpblank
+  adb -s 2G0YC5ZGB405BG logcat -c
+  adb -s 2G0YC5ZGB405BG shell am start -n com.UnityTechnologies.com.unity.template.urpblank/com.unity3d.player.UnityPlayerGameActivity
+
+  # 3. Wait for stable state, then verify alive
+  sleep 15
+  adb -s 2G0YC5ZGB405BG shell pidof com.UnityTechnologies.com.unity.template.urpblank   # should print PID
+  adb -s 2G0YC5ZGB405BG logcat -d | grep -c "Crash detected.*urpblank"                  # should print 0
+
+  # 4. Screencap
+  adb -s 2G0YC5ZGB405BG shell screencap -p > /tmp/shot.png
+  # Open /tmp/shot.png; you'll see left and right eye halves.
+  ```
+  If the screencap is empty / 0 bytes, the device is in standby mode. Tap any controller / hand / nudge the device to wake it.
+
+- **Package + activity names** (don't change):
+  - APK package: `com.UnityTechnologies.com.unity.template.urpblank` (yes, the URP-blank-template name; the project's `applicationIdentifier` was never updated — see "Day 7" item in the implementation plan; out of scope for compositor work)
+  - Launch activity: `com.unity3d.player.UnityPlayerGameActivity`
+  - Device serial: `2G0YC5ZGB405BG` (the lab Quest 3)
+
+### Things to avoid (learned the hard way)
+
+- **Do NOT mutate `OpenXR Package Settings.asset` from the build pipeline.** Earlier `StereoCompositorBuildSetup.EnsureEnabledForAndroid` toggled features per build; that combined with rapid install/uninstall cycles destabilized device-side XR init. If features need toggling, do it once via a `[MenuItem]` in the Unity Editor.
+- **Do NOT install/uninstall the app dozens of times in a row without rebooting the Quest.** Quest's runtime accumulates state that pollutes XR display init. After ~30 deploys, reboot.
+- **Do NOT `[RuntimeInitializeOnLoadMethod]`-spawn `CompositionLayer` GameObjects.** Confirmed unsafe — `CompositionLayerManager.FindObjectsByType` SEGVs during scene refresh on a runtime-added CompositionLayer. Edit-time scene authoring only.
+- **Do NOT use `OpenXRCustomLayerHandler<XrCompositionLayerQuad>`** as the base for our handler — static singleton conflict with stock `OpenXRQuadLayer`. Use `ILayerHandler` directly OR `OpenXRCustomLayerHandler<MyDistinctStruct>` with a memory-identical struct of a different C# type.
+- **Do NOT trust `signal 11`-substring greps for crash detection.** The logcat ring buffer rolls quickly. Use `Crash detected: NATIVE_CRASH_REPORT` from `DiagnosticsCollectorService` as the canonical signal.
+- **Do NOT assume Homebrew adb and Unity adb coexist.** They fight for port 5037. Pick one (Unity's is what `gh` and CI scripts expect): `export PATH="/Applications/Unity/Hub/Editor/6000.4.5f1/PlaybackEngines/AndroidPlayer/SDK/platform-tools:$PATH"` and kill the other daemon.
+
+---
+
 ## Goal
 
 Replicate the architecture of the native Meta Spatial SDK player using Unity's

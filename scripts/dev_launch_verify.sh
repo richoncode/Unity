@@ -10,8 +10,37 @@ set -u
 PKG="${1:-${PKG:-com.UnityTechnologies.com.unity.template.urpblank}}"
 ACT="${ACT:-com.unity3d.player.UnityPlayerGameActivity}"
 ADB="${ADB:-/Applications/Unity/Hub/Editor/6000.4.5f1/PlaybackEngines/AndroidPlayer/SDK/platform-tools/adb -s 2G0YC5ZGB405BG}"
+ADB_BIN="${ADB%% *}"  # bare adb path (no -s SERIAL) for daemon-management calls
 
 step() { printf '\n>>>>>>>>>>>>>>>>>>>>  %s  ::  %s  <<<<<<<<<<<<<<<<<<<<\n\n' "$(date '+%H:%M:%S')" "$1"; }
+
+# robust_pidof: pidof with one auto-retry through `adb start-server` if the
+# adb daemon dies mid-flight. The daemon dies semi-randomly on this Mac
+# (Homebrew/Unity/Android Studio adb binaries race for port 5037). We've
+# observed this fail in practice between PID(t=0) and PID(t+3s) checks,
+# producing a false "app not running" result.
+#
+# Distinguishes "adb itself errored" (non-zero exit + stderr message) from
+# "process not running" (zero exit + empty stdout) — only retries the former.
+robust_pidof() {
+    local out errfile rc
+    for attempt in 1 2; do
+        errfile=$(mktemp /tmp/robust_pidof.err.XXXXXX)
+        out=$($ADB shell pidof "$PKG" 2>"$errfile")
+        rc=$?
+        if [ $rc -eq 0 ]; then
+            rm -f "$errfile"
+            printf '%s' "$out" | tr -d '\r' | tr -d ' '
+            return 0
+        fi
+        echo "[harden] pidof attempt $attempt failed ($(head -1 "$errfile" 2>/dev/null)); restarting adb daemon" >&2
+        rm -f "$errfile"
+        "$ADB_BIN" start-server >/dev/null 2>&1 || true
+        sleep 1
+    done
+    echo "[harden] pidof still failing after retry — adb daemon hosed" >&2
+    return 1
+}
 
 step "wake + prox_close (idempotent)"
 $ADB shell input keyevent KEYCODE_WAKEUP || true
@@ -36,10 +65,13 @@ $ADB shell am start -W -n "$PKG/$ACT" 2>&1 | tail -8
 sleep 8
 
 step "verify alive"
-PID1=$($ADB shell pidof "$PKG" | tr -d '\r' | tr -d ' ')
+# Pre-emptively poke the adb daemon (idempotent — start-server is a no-op
+# if it's already running) before starting the verify sequence.
+"$ADB_BIN" start-server >/dev/null 2>&1 || true
+PID1=$(robust_pidof)
 echo "PID=$PID1"
 sleep 3
-PID2=$($ADB shell pidof "$PKG" | tr -d '\r' | tr -d ' ')
+PID2=$(robust_pidof)
 echo "PID(t+3s)=$PID2"
 
 if [ -z "$PID1" ] || [ -z "$PID2" ]; then

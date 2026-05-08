@@ -8,8 +8,8 @@ against an expected color. Per-eye expected colors can differ (useful for
 stereo asymmetry tests); default is the same color for both eyes.
 
 Usage:
-  dev_verify_purple.py [--left NAME-OR-RGB] [--right NAME-OR-RGB]
-                       [--tolerance N] [--coverage P] [PATH]
+  dev_verify_color.py [--left NAME-OR-RGB] [--right NAME-OR-RGB]
+                      [--tolerance N] [--coverage P] [PATH]
 
   --left   COLOR     expected left-eye color (default: yellow)
   --right  COLOR     expected right-eye color (default: same as --left)

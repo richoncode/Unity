@@ -76,12 +76,12 @@ namespace Quintar.StereoVideoCompositor.Editor
             var col = disc.GetComponent<Collider>();
             if (col != null) Object.DestroyImmediate(col);
 
-            // Pure yellow, Unlit so it doesn't depend on scene lighting.
+            // Pure green, Unlit so it doesn't depend on scene lighting.
             // (Class name still says "Purple" — kept stable to avoid asmdef churn;
             // color is the only thing that varies iteration-to-iteration.)
             var shader = Shader.Find("Universal Render Pipeline/Unlit") ?? Shader.Find("Unlit/Color");
             var rend = disc.GetComponent<Renderer>();
-            var color = new Color(1f, 1f, 0f, 1f); // yellow
+            var color = new Color(0f, 1f, 0f, 1f); // green
             var mat = new Material(shader) { color = color };
             // URP Unlit uses _BaseColor; legacy Unlit/Color uses _Color. Set both safely.
             if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", color);
@@ -91,7 +91,7 @@ namespace Quintar.StereoVideoCompositor.Editor
             EditorSceneManager.MarkSceneDirty(scene);
             EditorSceneManager.SaveScene(scene);
 
-            Debug.Log($"[TestPurpleCircleSetup] Added '{GoName}' under {parentName} at local (0,0,1), 1 m diameter, yellow Unlit (shader={shader.name}).");
+            Debug.Log($"[TestPurpleCircleSetup] Added '{GoName}' under {parentName} at local (0,0,1), 1 m diameter, green Unlit (shader={shader.name}).");
         }
     }
 }

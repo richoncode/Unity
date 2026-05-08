@@ -172,7 +172,7 @@ place so they can be edited individually):
 [`dev_install_verify.sh`](scripts/dev_install_verify.sh),
 [`dev_launch_verify.sh`](scripts/dev_launch_verify.sh),
 [`dev_screencap.sh`](scripts/dev_screencap.sh),
-[`dev_verify_purple.py`](scripts/dev_verify_purple.py).
+[`dev_verify_color.py`](scripts/dev_verify_color.py).
 
 **About keep-awake state:** the model is *persistent settings + volatile
 setprops applied once*, not a polling daemon. `dev.sh keep-awake-on`

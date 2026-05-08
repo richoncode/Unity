@@ -115,7 +115,6 @@ CAPTURE / VERIFY:
                              blue|cyan|magenta|orange|white|black), "R,G,B",
                              or "#RRGGBB". Defaults: L=yellow, R=L.
                              Auto-screencaps if latest is missing/stale.
-  verify-purple [...]        Legacy alias for verify-color.
   logs <pattern>             Last 200 logcat lines matching pattern (regex)
   crash-stack                Latest crash buffer summary
   pidof                      Print app's current PID (or empty)
@@ -378,7 +377,7 @@ ensure_adb_alive() {
 # Ensure the Quest's display is producing frames. Probe via screencap; if
 # the buffer is empty/tiny, the screen is off — run the wake sequence
 # (KEYCODE_WAKEUP, prox_close, KEYCODE_POWER toggle) and re-probe. Verbs
-# that consume display output (screencap, verify-purple) should call this
+# that consume display output (screencap, verify-color) should call this
 # first, otherwise they hit silent 0-byte captures.
 ensure_device_awake() {
     ensure_adb_alive
@@ -457,11 +456,8 @@ verb_verify_color() {
         note "no recent valid screencap — capturing now"
         verb_screencap
     fi
-    python3 "$SCRIPTS_DIR/dev_verify_purple.py" --left "$LEFT" --right "$RIGHT" "$LATEST_SHOT"
+    python3 "$SCRIPTS_DIR/dev_verify_color.py" --left "$LEFT" --right "$RIGHT" "$LATEST_SHOT"
 }
-
-# Legacy alias: defaults to current disc test color.
-verb_verify_purple() { verb_verify_color "${1:-yellow}" "${2:-}"; }
 
 verb_logs() {
     local PATTERN="${1:-}"
@@ -541,9 +537,10 @@ verb_tests() {
 verb_test() {
     local NAME="${1:-}"
     if [ -z "$NAME" ]; then
-        err "usage: dev.sh test <name>   (use 'dev.sh tests' to list)"
+        err "usage: dev.sh test <name> [args...]   (use 'dev.sh tests' to list)"
         return 1
     fi
+    shift
     local TEST_SCRIPT="$SCRIPTS_DIR/tests/test_${NAME//-/_}.sh"
     if [ ! -x "$TEST_SCRIPT" ]; then
         err "no such test: $NAME (looked at $TEST_SCRIPT)"
@@ -551,9 +548,10 @@ verb_test() {
         return 1
     fi
     # Mirror everything to /tmp/quest_run.log so a Monitor can stream
-    # banners + key metrics to chat in real time.
+    # banners + key metrics to chat in real time. Forward any extra args
+    # to the test (e.g. `dev.sh test marker green` -> test_marker.sh green).
     : > "$RUN_LOG"
-    "$TEST_SCRIPT" 2>&1 | tee -a "$RUN_LOG"
+    "$TEST_SCRIPT" "$@" 2>&1 | tee -a "$RUN_LOG"
     return ${PIPESTATUS[0]}
 }
 
@@ -586,7 +584,6 @@ case "$VERB" in
     reboot-app)       verb_reboot_app ;;
     screencap)        verb_screencap ;;
     verify-color)     verb_verify_color "$@" ;;
-    verify-purple)    verb_verify_purple "$@" ;;
     logs)             verb_logs "$@" ;;
     crash-stack)      verb_crash_stack ;;
     pidof)            verb_pidof ;;

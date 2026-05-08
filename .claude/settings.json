@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//tmp/**)",
+
+      "Bash(/Users/richardbailey/RichardClaude/Unity/scripts/dev.sh *)",
+      "Bash(/Users/richardbailey/RichardClaude/Unity/scripts/dev.sh)",
+
+      "Bash(chmod +x /Users/richardbailey/RichardClaude/Unity/scripts/*)",
+      "Bash(ls /Users/richardbailey/RichardClaude/Unity/scripts/)",
+      "Bash(ls -la /Users/richardbailey/RichardClaude/Unity/scripts/*)"
+    ]
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/scripts/hooks/hook_screenshot_rule.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

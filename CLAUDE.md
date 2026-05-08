@@ -41,6 +41,14 @@ This is the rhythm. Use it unless the architect plan says otherwise.
 
 ## Pre-authorized actions (just do them; do not ask)
 
+**Blanket adb authorization for the lab Quest 3 (`2G0YC5ZGB405BG`):** every
+`adb` command targeted at that serial is pre-authorized. Never stop to ask
+permission for an adb action — including ones not enumerated below. The
+enumerated list is documentation, not a closed set. The only adb-related
+gating is the device serial (do not run destructive commands against
+unrelated attached devices) and the standard global rules (no remote
+mutations beyond this workspace, etc.).
+
 ### Caches and builds
 - Delete and recreate `Library/`, `Builds/`, `Logs/`, `Temp/`, `Obj/`, `build/`,
   `.gradle/` at any depth. These are caches; regenerated on next build.
@@ -48,11 +56,182 @@ This is the rhythm. Use it unless the architect plan says otherwise.
 - Modify `Packages/manifest.json` to add/remove/upgrade packages.
 
 ### Device (Quest 3 serial `2G0YC5ZGB405BG`, lab device on a stand at 0.8 m, NOT being worn)
-- `adb install -r`, `adb uninstall`, `adb shell am force-stop`,
-  `adb shell am start`, `adb logcat -c`, `adb shell screencap`, `adb reboot`.
-  The device is in a lab — reboot is non-disruptive.
+- **All `adb` commands targeted at this device are pre-authorized.** Do not
+  pause to confirm individual adb actions, including but not limited to:
+  `adb install -r`, `adb uninstall`, `adb shell am force-stop`, `adb shell
+  am start`, `adb shell am force-stop com.oculus.vrshell` (kills the Quest
+  controller-required dialog so headless launches succeed), `adb logcat
+  -c`, `adb logcat -d`, `adb shell screencap`, `adb shell input keyevent`,
+  `adb shell setprop`, `adb shell pm path`, `adb shell md5sum`, `adb shell
+  ps`, `adb shell dumpsys`, `adb shell settings put`, `adb shell
+  wm`, `adb wait-for-device`, `adb reboot`, `adb push`, `adb pull` to/from
+  app-writable paths, `adb forward`, `adb shell svc`. The device is in a
+  lab — reboot is non-disruptive.
 - Kill / restart adb daemons as needed (Mac has both Homebrew and Unity
   installations of adb fighting for port 5037; pick one and stick with it).
+- The serial `2G0YC5ZGB405BG` scopes the authorization: do not run
+  destructive adb commands against any *other* device that happens to be
+  attached.
+
+### Headless / on-a-stand operation: keep the device awake
+
+The Quest 3 is on a stand and not being worn. By default Quest will:
+
+- Refuse to render / screencap when the proximity sensor reads "uncovered"
+  (lens cover open, no head detected). Screencaps come back black; apps
+  pause; logcat goes quiet.
+- Power down to "sleep" after a short idle, especially after reboot. Apps
+  launched while sleeping never get a render frame.
+- After `adb reboot`, the device boots but stops at a sleep / boot-into-
+  off-head state — it does NOT auto-resume into apps. Without intervention
+  the autonomous flow stalls here.
+
+The standard "lab-mode" recipe to keep the device permanently awake and
+behaving as if worn:
+
+```sh
+ADB="adb -s 2G0YC5ZGB405BG"
+$ADB shell input keyevent KEYCODE_WAKEUP                                 # wake from sleep
+$ADB shell am broadcast -a com.oculus.vrpowermanager.prox_close          # fake proximity = covered
+$ADB shell am broadcast -a com.oculus.vrpowermanager.automation_disable  # disable idle-power-down
+```
+
+`prox_close` is the load-bearing one: it makes the OS treat the device as
+worn, so rendering, screencap, and the OpenXR session all behave normally
+even though the lens cover is open and the proximity sensor sees nothing.
+The state persists until the next `adb reboot` or until you send
+`prox_open`. Re-broadcast `prox_close` after every reboot.
+
+### CANONICAL STATE MACHINE (top-level, do not improvise around this)
+
+When the user asks for "top level states and actions", reaffirm exactly this:
+
+**States:**
+- `ready-for-automation` — adb up, persistent settings applied, VR session
+  live, no app foreground (Quest shell).
+- `ready-to-run-app` — `ready-for-automation` + our APK installed (md5
+  verified against the local build).
+- `running-app` — `ready-to-run-app` + our app foreground, alive.
+
+**Primary transitions (verbs on `dev.sh`):**
+| Verb | Transition |
+|---|---|
+| `dev.sh begin-automation` | any → ready-for-automation |
+| `dev.sh install-app`      | ready-for-automation → ready-to-run-app |
+| `dev.sh run-app`          | ready-to-run-app → running-app |
+| `dev.sh kill-app`         | running-app → ready-for-automation |
+| `dev.sh reboot-app`       | any → ready-for-automation (via reboot) |
+| `dev.sh end-automation`   | exits the harness, restores Quest defaults |
+
+`install` / `launch` / `reboot-recover` are kept as legacy aliases of the
+canonical names; new code should use the canonical forms.
+
+### THE RULE: use `scripts/dev.sh` for all automation. Never chain commands.
+
+[`scripts/dev.sh`](scripts/dev.sh) is the single router for every dev-loop
+operation. It dispatches to verbs (`init`, `begin-automation`, `build`,
+`install-app`, `run-app`, `kill-app`, `screencap`, `verify-color`, `tag`,
+`logs`, `crash-stack`, `keep-awake-*`, `reboot-app`, `test`, etc.). One
+permission rule covers it all:
+`Bash(/Users/richardbailey/RichardClaude/Unity/scripts/dev.sh *)`.
+
+**Two non-negotiable rules for the AI:**
+
+1. **Never chain commands.** No `;`, `&&`, `||`, pipes, or `$(...)` in a
+   single Bash tool call. Each chained piece would otherwise need its own
+   allow rule. Orchestrate by issuing **separate `Bash` tool calls** —
+   `dev.sh build`, then `dev.sh install`, then `dev.sh launch`. Each call's
+   output streams to chat independently, which is also how live progress
+   becomes visible in CCD.
+
+2. **Don't invent new scripts mid-flow.** If a recurring need shows up
+   (new diagnostic, new chain), add a verb to `dev.sh` rather than a
+   one-off `dev_foo.sh`. New scripts get pinned as new exact-string
+   permission entries; new verbs do not.
+
+**Fixed artifact paths** (verbs write here; AI reads from here):
+- `/tmp/quest_latest_shot.png` — last screencap (`dev.sh screencap`)
+- `/tmp/quest_latest_logcat.txt` — last `dev.sh logs <pattern>` output
+- `/tmp/quest_latest_crash.txt` — last `dev.sh crash-stack` output
+- `/tmp/quest_build.log` — last `dev.sh build` output
+
+For named runs, `dev.sh tag <name>` snapshots all `quest_latest_*` to
+`/tmp/quest_tagged_<name>_*`.
+
+**At the start of every autonomous session**, call `dev.sh init` once. It
+verifies Pillow, adb, device reachability, Unity binary, project tree, and
+the persistent keep-awake state (settings + setprops). If keep-awake is
+not fully applied (incl. the volatile `debug.oculus.skipProxBlanking` /
+`alwaysOn` setprops which reboot wipes), it re-applies them. Fails loudly
+on any missing piece with a remediation hint — no surprises mid-flow.
+
+**Underlying scripts** (called by `dev.sh`, NOT directly by the AI; left in
+place so they can be edited individually):
+[`dev_reboot_recover.sh`](scripts/dev_reboot_recover.sh),
+[`dev_wake.sh`](scripts/dev_wake.sh),
+[`dev_install_verify.sh`](scripts/dev_install_verify.sh),
+[`dev_launch_verify.sh`](scripts/dev_launch_verify.sh),
+[`dev_screencap.sh`](scripts/dev_screencap.sh),
+[`dev_verify_purple.py`](scripts/dev_verify_purple.py).
+
+**About keep-awake state:** the model is *persistent settings + volatile
+setprops applied once*, not a polling daemon. `dev.sh keep-awake-on`
+(invoked by `init` and `begin-automation`) sets:
+
+- `secure vr_sensor_state = 0` (persistent — survives reboot)
+- `system screen_off_timeout = 999999999` (persistent)
+- `setprop debug.oculus.skipProxBlanking 1` (volatile — wiped on reboot,
+  but load-bearing: without it, Quest blanks the display the moment the
+  proximity sensor reads "off head", regardless of the other settings)
+- `setprop debug.oculus.alwaysOn 1` (volatile)
+
+`init` checks BOTH the settings and the setprops; if either is missing it
+re-applies. `reboot-recover` re-applies automatically after the reboot.
+Neither `dev_launch_verify.sh` nor `dev_wake.sh` kills `com.oculus.vrshell`
+anymore — that was the old daemon-era doctrine and was tearing down VR
+sessions.
+
+Standard work-loop after a code change (each line is a SEPARATE Bash tool
+call by the AI — do not collapse into one chained command):
+
+```sh
+dev.sh build         # Unity batchmode build (STEREO_SKIP_PANEL=1 default)
+dev.sh install-app   # install + md5 verify
+dev.sh run-app       # force-stop our app + am start + verify alive
+dev.sh screencap     # writes /tmp/quest_latest_shot.png
+dev.sh verify-color  # pixel-sample per eye against expected color
+```
+
+Issue each verb as a separate `Bash` tool call — do NOT chain them. Each
+call's output streams to chat independently, which is also how live progress
+becomes visible in CCD.
+
+Reboot recovery is rare (only when device-state pollution warrants Tier 4)
+because the persistent keep-awake settings (`vr_sensor_state=0`,
+`screen_off_timeout=long`) plus the `debug.oculus.skipProxBlanking=1`
+setprop keep the device alive between sessions. After reboot, setprops
+are wiped — `dev.sh reboot-recover` re-applies `keep-awake-on`
+automatically before returning.
+
+### Quest controller-required dialog mechanic (load-bearing in dev_launch_verify.sh)
+
+The dialog is intercepted at the system_server level by
+`RequiresControllersLaunchInterceptor`, NOT by `com.oculus.vrshell`. Killing
+vrshell *before* `am start` is ineffective — the interceptor still fires and
+redirects our launch. The pattern that works (encoded in
+`dev_launch_verify.sh`):
+
+1. `am force-stop com.oculus.vrshell` (clears any active dialog)
+2. **wait 3 s** — load-bearing; gives the system time to settle
+3. `am start -n <pkg>/<activity>` — interceptor fires but dialog never
+   gains focus
+4. Post-launch loop: `am force-stop com.oculus.vrshell` x6 over 3 s — if
+   the dialog snuck through, this dismisses it and the AM resumes the
+   original launch
+
+If you ever change the launch flow, preserve the 3-second wait between
+vrshell-kill and `am start`. Without it, vrshell respawns in time for the
+interceptor to redirect, and `pidof` comes back empty.
 
 ### Code edits
 - Edit any file under `VibeUnity1/Assets/`, `VibeUnity1/ProjectSettings/`,

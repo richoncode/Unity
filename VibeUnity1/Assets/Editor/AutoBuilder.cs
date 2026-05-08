@@ -7,6 +7,7 @@ public class AutoBuilder
     {
         Quintar.StereoVideoCompositor.Editor.StereoCompositorBuildSetup.EnsureEnabledForAndroid();
         Quintar.StereoVideoCompositor.Editor.StereoCompositorSceneSetup.EnsureSceneAuthored();
+        Quintar.StereoVideoCompositor.Editor.TestPurpleCircleSetup.EnsureInScene();
 
         string[] scenes = { "Assets/Scenes/MR_Passthrough_Scene.unity" };
         BuildPlayerOptions options = new BuildPlayerOptions();

@@ -1,0 +1,6 @@
+<linker>
+  <assembly fullname="Quintar.StereoVideoCompositor" preserve="all"/>
+  <assembly fullname="Unity.XR.OpenXR" preserve="all"/>
+  <assembly fullname="Unity.XR.CompositionLayers" preserve="all"/>
+  <assembly fullname="Unity.XR.CompositionLayers.Extensions" preserve="all"/>
+</linker>

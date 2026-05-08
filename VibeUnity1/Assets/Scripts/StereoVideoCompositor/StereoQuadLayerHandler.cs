@@ -142,10 +142,28 @@ namespace Quintar.StereoVideoCompositor
         {
             if (m_SetActiveLogCount < 5)
             {
-                Debug.Log($"[{Tag}] SetActiveLayer id={layerInfo.Id} order={layerInfo.Layer.Order}");
+                Debug.Log($"[REPRO-3] [{Tag}] SetActiveLayer id={layerInfo.Id} order={layerInfo.Layer.Order}");
                 m_SetActiveLogCount++;
             }
-            base.SetActiveLayer(layerInfo);
+            // NOTE: deliberately NOT calling base.SetActiveLayer.
+            // The base implementation populates m_ActiveNativeLayers /
+            // m_ActiveNativeLayerOrders / m_ActiveNativeLayerCount, expecting
+            // its own OnUpdate() to drain them and reset the count to 0. Our
+            // override of OnUpdate emits per-eye submissions from
+            // m_ActiveLayerStates instead and never resets the count, which
+            // produces a NativeArray buffer overrun starting on frame 2 and
+            // corrupts the unmanaged heap (causing the random URP / XR /
+            // Vulkan SEGV signatures we were chasing for hours on 2026-05-08).
+            //
+            // Skipping base.SetActiveLayer entirely means we have to drive
+            // the swapchain/texture-blit lifecycle ourselves: invoke
+            // ActiveNativeLayer directly so m_RenderInfos[id].IsActiveLayer
+            // = true and RequestRenderTextureId fires. See
+            // OpenXRCustomLayerHandler.SetActiveLayer for the original flow.
+            if (m_nativeLayers.TryGetValue(layerInfo.Id, out var nativeLayer))
+            {
+                ActiveNativeLayer(layerInfo, ref nativeLayer);
+            }
 
             var tex = layerInfo.Layer.GetComponent<TexturesExtension>();
             if (tex == null || !tex.enabled || tex.LeftTexture == null)
@@ -165,6 +183,7 @@ namespace Quintar.StereoVideoCompositor
             base.RemoveLayer(removedLayerId);
         }
 
+        int m_OnUpdateLogCount;
         public override void OnUpdate()
         {
             // Drain the actions queue ourselves (mirrors base.OnUpdate behavior) so the
@@ -176,7 +195,14 @@ namespace Quintar.StereoVideoCompositor
             }
 
             if (m_ActiveLayerStates.Count == 0)
+            {
+                // Still call base.OnUpdate() to keep its m_ActiveNativeLayerCount
+                // reset at 0 (defense in depth — should already be 0 since we
+                // skip base.SetActiveLayer's populate path, but we don't want
+                // to rely on that staying true for future package updates).
+                base.OnUpdate();
                 return;
+            }
 
             var perFrame = new NativeArray<XrCompositionLayerQuad>(m_ActiveLayerStates.Count * 2, Allocator.Temp);
             var orders = new NativeArray<int>(m_ActiveLayerStates.Count * 2, Allocator.Temp);
@@ -227,6 +253,11 @@ namespace Quintar.StereoVideoCompositor
                             writeIndex,
                             UnsafeUtility.SizeOf<XrCompositionLayerQuad>());
                     }
+                    if (m_OnUpdateLogCount < 5)
+                    {
+                        Debug.Log($"[REPRO-4] [{Tag}] OnUpdate submitted writeIndex={writeIndex} layers (frame {m_OnUpdateLogCount})");
+                        m_OnUpdateLogCount++;
+                    }
                 }
             }
             finally
@@ -235,6 +266,11 @@ namespace Quintar.StereoVideoCompositor
                 orders.Dispose();
                 m_ActiveLayerStates.Clear();
             }
+
+            // Defense in depth: keep base m_ActiveNativeLayerCount reset at 0
+            // (would only matter if some future package change adds a code
+            // path that touches it without our knowledge).
+            base.OnUpdate();
         }
 
         static void ComputeEyeRects(StereoLayout layout, int srcWidth, int srcHeight, out XrRect2Di leftRect, out XrRect2Di rightRect)

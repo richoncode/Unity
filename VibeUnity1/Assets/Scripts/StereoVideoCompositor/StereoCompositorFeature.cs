@@ -53,10 +53,10 @@ namespace Quintar.StereoVideoCompositor
 
         void OnLayerProviderStarted()
         {
-            Debug.Log($"[{Tag}] OpenXRLayerProvider.Started fired. Registering StereoQuadLayerHandler.");
+            Debug.Log($"[REPRO-2] [{Tag}] OpenXRLayerProvider.Started fired. Registering StereoQuadLayerHandler.");
             var handler = new StereoQuadLayerHandler();
             OpenXRLayerProvider.RegisterLayerHandler(typeof(StereoQuadLayerData), handler);
-            Debug.Log($"[{Tag}] StereoQuadLayerHandler registered for StereoQuadLayerData.");
+            Debug.Log($"[REPRO-2b] [{Tag}] StereoQuadLayerHandler registered for StereoQuadLayerData.");
         }
 
         protected override bool OnInstanceCreate(ulong xrInstance)

@@ -1,5 +1,6 @@
 #if UNITY_EDITOR
 using System.Linq;
+using Quintar.StereoVideoCompositor;
 using Unity.XR.CompositionLayers;
 using Unity.XR.CompositionLayers.Extensions;
 using Unity.XR.CompositionLayers.Layers;
@@ -56,10 +57,42 @@ namespace Quintar.StereoVideoCompositor.Editor
             }
 
             var panel = new GameObject(PanelGoName);
-            panel.transform.position = new Vector3(0f, 1.5f, 1.5f);
-            panel.transform.rotation = Quaternion.Euler(0f, 180f, 0f);
+            // Parent under OVRCameraRig.TrackingSpace so the panel is
+            // positioned relative to the device, not world. The lab device
+            // sits at ~0.8 m head height; world (0, 1.5, 1.5) puts the panel
+            // above the eyebrow line. local (0, 0, 1.5) under TrackingSpace
+            // keeps it dead ahead of the device. Same pattern as
+            // TestPurpleCircleSetup.cs.
+            var rig = GameObject.Find("OVRCameraRig");
+            Transform parent = null;
+            string parentName = "<world>";
+            if (rig != null)
+            {
+                var ts = rig.transform.Find("TrackingSpace");
+                if (ts != null) { parent = ts; parentName = "OVRCameraRig/TrackingSpace"; }
+                else            { parent = rig.transform; parentName = "OVRCameraRig"; }
+            }
+            if (parent != null)
+            {
+                panel.transform.SetParent(parent, false);
+                panel.transform.localPosition = new Vector3(0f, 0f, 1.5f);
+                panel.transform.localRotation = Quaternion.Euler(0f, 180f, 0f);
+            }
+            else
+            {
+                panel.transform.position = new Vector3(0f, 1.5f, 1.5f);
+                panel.transform.rotation = Quaternion.Euler(0f, 180f, 0f);
+            }
+            Debug.Log($"[REPRO-1d] StereoCompositorSceneSetup: panel parented under {parentName} at local {panel.transform.localPosition} rot {panel.transform.localRotation.eulerAngles}");
+            // Isolate panel onto IgnoreRaycast layer (2) so any URP camera
+            // culling treats it deterministically. CompositionLayers render
+            // outside URP, but layer-stack interactions have been seen to
+            // affect XRDisplaySubsystem render-pass indexing (Step 3).
+            panel.layer = LayerMask.NameToLayer("Ignore Raycast");
+            panel.isStatic = false;
 
             var useStockType = System.Environment.GetEnvironmentVariable("STEREO_USE_STOCK_QUAD") == "1";
+            Debug.Log($"[REPRO-1] StereoCompositorSceneSetup: about to AddComponent<CompositionLayer> on panel (useStockType={useStockType})");
             var compLayer = panel.AddComponent<CompositionLayer>();
             if (useStockType)
             {
@@ -88,6 +121,42 @@ namespace Quintar.StereoVideoCompositor.Editor
             var tex = panel.AddComponent<TexturesExtension>();
             tex.sourceTexture = TexturesExtension.SourceTextureEnum.LocalTexture;
             tex.LeftTexture = testTexture;
+            // Set RightTexture too so the handler's per-eye swapchain creation
+            // doesn't dereference a null right-eye surface (vk::RenderSurface::
+            // GetFormat crash signature). The handler still computes per-eye
+            // SubImage rects from the same TopBottom layout — both eyes read
+            // their slice from the same texture.
+            tex.RightTexture = testTexture;
+
+            // Strip CompositionOutline (debug-visualization helper auto-added
+            // alongside CompositionLayer). It uses uGUI Canvas rendering,
+            // which has been observed to trigger
+            // CanvasProxy::SendPreWillRenderCanvases SEGVs at runtime when
+            // combined with our custom layer handler. Not needed for runtime;
+            // editor-only gizmos remain available via menu.
+            foreach (var c in panel.GetComponents<Component>())
+            {
+                if (c != null && c.GetType().Name == "CompositionOutline")
+                {
+                    Object.DestroyImmediate(c);
+                    Debug.Log("[REPRO-1c] StereoCompositorSceneSetup: removed auto-added CompositionOutline component.");
+                }
+            }
+
+            // Verify panel has ONLY the components we expect — no MeshRenderer,
+            // no MeshFilter, no LODGroup, no Canvas, nothing that triggers URP
+            // or canvas-render traversal we don't intend.
+            var components = panel.GetComponents<Component>();
+            var compNames = string.Join(", ", components.Select(c => c.GetType().Name));
+            Debug.Log($"[REPRO-1b] StereoCompositorSceneSetup: panel components: [{compNames}]");
+
+            // PinRefreshRate: keep displayFrequency at 72 Hz to remove the
+            // refresh-rate-oscillation variable from the SEGV diagnosis (Step 3).
+            const string PinGoName = "[Compositor] PinRefreshRate";
+            var existingPin = SceneManager.GetActiveScene().GetRootGameObjects().FirstOrDefault(go => go.name == PinGoName);
+            if (existingPin != null) Object.DestroyImmediate(existingPin);
+            var pinGo = new GameObject(PinGoName);
+            pinGo.AddComponent<PinRefreshRate>();
 
             EditorSceneManager.MarkSceneDirty(scene);
             EditorSceneManager.SaveScene(scene);

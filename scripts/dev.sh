@@ -98,7 +98,11 @@ DEVICE STATE:
   reboot                     Just reboot (no recovery sequence; rarely needed)
 
 BUILD / DEPLOY (canonical names match the state machine above):
-  build                      Unity batchmode build (STEREO_SKIP_PANEL=1)
+  build [flags]              Unity batchmode build. Flags (default: panel
+                             OFF, marker ON, stock-quad OFF):
+                               --with-panel / --no-panel
+                               --with-marker / --no-marker
+                               --stock-quad / --no-stock-quad
   install-app                Install APK + verify md5  -> ready-to-run-app
                              (alias: install)
   run-app                    am start + verify alive   -> running-app
@@ -115,6 +119,11 @@ CAPTURE / VERIFY:
                              blue|cyan|magenta|orange|white|black), "R,G,B",
                              or "#RRGGBB". Defaults: L=yellow, R=L.
                              Auto-screencaps if latest is missing/stale.
+  layer-count                Print latest VrApi 'LCnt=N' (canonical
+                             compositor-layer-count probe).
+  alive-for <seconds>        Poll pidof every 1s for N seconds; exit 0
+                             only if PID is non-empty AND stable the
+                             entire interval.
   logs <pattern>             Last 200 logcat lines matching pattern (regex)
   crash-stack                Latest crash buffer summary
   pidof                      Print app's current PID (or empty)
@@ -313,6 +322,14 @@ verb_keep_awake_on() {
     $ADB shell setprop debug.oculus.skipProxBlanking 1
     $ADB shell setprop debug.oculus.alwaysOn 1
 
+    # vrshell caches launch-check / controller-emulation policy and
+    # actively writes-back-to-defaults on its lifecycle init. To make
+    # our settings stick, kill vrshell FIRST, give the system a moment
+    # to settle, THEN write the settings, THEN spoof prox_close. The
+    # respawning vrshell reads the new settings on its first init.
+    $ADB shell am force-stop com.oculus.vrshell 2>/dev/null || true
+    sleep 2
+
     # Persistent settings (survive reboot).
     # - vr_sensor_state=0 + screen_off_timeout=long: never sleep.
     # - skip_launch_check_requires_controllers_enabled=true +
@@ -330,12 +347,6 @@ verb_keep_awake_on() {
 
     # Spoof "covered" so the runtime starts a VR session immediately.
     $ADB shell am broadcast -a com.oculus.vrpowermanager.prox_close >/dev/null 2>&1 || true
-
-    # vrshell caches the launch-check policy; force it to reload by
-    # killing it once. This is a one-shot at state-transition time, NOT
-    # an ongoing daemon — re-applying keep-awake-on later does the same
-    # thing once and stops.
-    $ADB shell am force-stop com.oculus.vrshell 2>/dev/null || true
 
     note "applied: skipProxBlanking=$($ADB shell getprop debug.oculus.skipProxBlanking | tr -d '\r') alwaysOn=$($ADB shell getprop debug.oculus.alwaysOn | tr -d '\r') vr_sensor_state=$($ADB shell settings get secure vr_sensor_state | tr -d '\r') screen_off_timeout=$($ADB shell settings get system screen_off_timeout | tr -d '\r') skip_launch_check=$($ADB shell settings get secure skip_launch_check_requires_controllers_enabled | tr -d '\r') controller_emulation=$($ADB shell settings get secure controller_emulation_mode | tr -d '\r')"
 }
@@ -381,9 +392,32 @@ verb_keep_awake_start()  { verb_keep_awake_on; }
 verb_keep_awake_stop()   { verb_keep_awake_off; }
 
 verb_build() {
-    step "Unity build (STEREO_SKIP_PANEL=1, TEST_PURPLE_CIRCLE=${TEST_PURPLE_CIRCLE:-1})"
-    STEREO_SKIP_PANEL=${STEREO_SKIP_PANEL:-1} \
-    TEST_PURPLE_CIRCLE=${TEST_PURPLE_CIRCLE:-1} \
+    # Build flags (parsed from `dev.sh build [flags]`):
+    #   --with-panel / --no-panel   STEREO_SKIP_PANEL = 0 / 1 (default 1)
+    #   --with-marker / --no-marker TEST_PURPLE_CIRCLE = 1 / 0 (default 1)
+    # Equivalent env vars still honored if set; CLI flags take precedence.
+    # CLI flags are necessary because env-var prefixes break Claude Code's
+    # permission matcher (e.g. `FOO=1 dev.sh build` doesn't match the
+    # `Bash(.../dev.sh *)` allowlist pattern).
+    local SKIP_PANEL="${STEREO_SKIP_PANEL:-1}"
+    local USE_MARKER="${TEST_PURPLE_CIRCLE:-1}"
+    local STOCK_QUAD="${STEREO_USE_STOCK_QUAD:-0}"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --with-panel)     SKIP_PANEL=0 ;;
+            --no-panel)       SKIP_PANEL=1 ;;
+            --with-marker)    USE_MARKER=1 ;;
+            --no-marker)      USE_MARKER=0 ;;
+            --stock-quad)     STOCK_QUAD=1 ;;
+            --no-stock-quad)  STOCK_QUAD=0 ;;
+            *) err "unknown build flag: $1"; return 2 ;;
+        esac
+        shift
+    done
+    step "Unity build (STEREO_SKIP_PANEL=$SKIP_PANEL, TEST_PURPLE_CIRCLE=$USE_MARKER, STEREO_USE_STOCK_QUAD=$STOCK_QUAD)"
+    STEREO_SKIP_PANEL="$SKIP_PANEL" \
+    TEST_PURPLE_CIRCLE="$USE_MARKER" \
+    STEREO_USE_STOCK_QUAD="$STOCK_QUAD" \
         "$UNITY" -batchmode -nographics -quit \
             -projectPath "$PROJECT" \
             -executeMethod AutoBuilder.BuildAndroid \
@@ -474,6 +508,53 @@ verb_kill_app() {
 
 verb_reboot_app() { verb_reboot_recover; }
 verb_screencap() { ensure_device_awake; "$SCRIPTS_DIR/dev_screencap.sh" "$LATEST_SHOT"; }
+
+verb_layer_count() {
+    # Print the latest VrApi LCnt=N value and exit 0 if parsed. Composes
+    # with `dev.sh logs` but is the canonical layer-count probe so the
+    # plan steps can declare expected values (e.g. baseline 5, panel-on 6).
+    ensure_adb_alive
+    local LCNT
+    LCNT=$($ADB logcat -d 2>/dev/null | grep "VrApi" | tail -3 | grep -oE 'LCnt=[0-9]+' | tail -1)
+    if [ -z "$LCNT" ]; then
+        err "no VrApi LCnt= line found in logcat (app running? logcat ring-buffer flushed?)"
+        return 1
+    fi
+    echo "$LCNT"
+}
+
+verb_alive_for() {
+    # Poll pidof every 1 s for SECONDS; exit 0 only if PID is stable and
+    # non-empty for the full interval. Replaces ad-hoc `sleep N && pidof`
+    # patterns so steps can declare a stability contract.
+    local SECONDS_TO_WATCH="${1:-15}"
+    if ! [[ "$SECONDS_TO_WATCH" =~ ^[0-9]+$ ]]; then
+        err "usage: dev.sh alive-for <seconds>"
+        return 1
+    fi
+    ensure_adb_alive
+    step "alive-for: watching $PKG for $SECONDS_TO_WATCH s"
+    local FIRST_PID="" PID
+    local i=0
+    while [ "$i" -lt "$SECONDS_TO_WATCH" ]; do
+        PID=$($ADB shell pidof "$PKG" 2>/dev/null | tr -d '\r' | tr -d ' ')
+        if [ -z "$PID" ]; then
+            err "alive-for: app not running at t=${i}s (PID empty)"
+            return 1
+        fi
+        if [ -z "$FIRST_PID" ]; then
+            FIRST_PID="$PID"
+            note "  t=0s PID=$PID"
+        elif [ "$PID" != "$FIRST_PID" ]; then
+            err "alive-for: PID changed at t=${i}s ($FIRST_PID -> $PID; app crashed and restarted)"
+            return 1
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    note "  t=${SECONDS_TO_WATCH}s PID=$FIRST_PID (stable)"
+    return 0
+}
 
 verb_verify_color() {
     # Color-agnostic per-eye disc verifier.
@@ -610,7 +691,7 @@ case "$VERB" in
     keep-awake-off)   verb_keep_awake_off ;;
     keep-awake-start) verb_keep_awake_start ;;
     keep-awake-stop)  verb_keep_awake_stop ;;
-    build)            verb_build ;;
+    build)            verb_build "$@" ;;
     install-app)      verb_install_app ;;
     install)          verb_install ;;
     uninstall)        verb_uninstall ;;
@@ -620,6 +701,8 @@ case "$VERB" in
     reboot-app)       verb_reboot_app ;;
     screencap)        verb_screencap ;;
     verify-color)     verb_verify_color "$@" ;;
+    layer-count)      verb_layer_count ;;
+    alive-for)        verb_alive_for "$@" ;;
     logs)             verb_logs "$@" ;;
     crash-stack)      verb_crash_stack ;;
     pidof)            verb_pidof ;;

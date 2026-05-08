@@ -7,6 +7,320 @@ Last updated: 2026-05-07.
 
 ---
 
+## 2026-05-07 — Architect: Incremental Implementation Plan
+
+**Where we are:** `dev.sh test marker` passes end-to-end (URP green-disc rendering, both eyes match, persistent keep-awake holding). The `[Compositor] StereoQuadPanel` GameObject with custom `StereoQuadLayerData` SEGVs in `LODGroupManager::GarbageCollectCameraLODData` a few seconds after launch, so every build today runs `STEREO_SKIP_PANEL=1` — the compositor pipeline is still completely cold on device. **End state of this plan:** a stereo quad compositor panel showing distinct left/right textures from a `TopBottom` source, alive and pixel-verified, with a clean substrate to drop the AndroidSurface/HLS/mask layers onto in a follow-up plan. Field-/attribute-level bisects on `StereoQuadLayerData` are exhausted (per the older "Bisect already ran" section); this plan attacks the SEGV from a different angle (LODGroup interaction, not LayerData fields) and only commits to a rewrite if that fails.
+
+### Steps
+
+#### Step 1 — Lock in baseline + add new dev.sh verbs we'll need throughout
+
+**Goal:** make the rest of the plan executable from `dev.sh` alone (no chained shell, no inline Python). Today's marker test only checks one solid color per eye; from Step 4 onward we need a per-eye left/right different-color check, a layer-count check, and a "stayed alive for N seconds" check.
+
+**Change:** add three verbs to `scripts/dev.sh` and one helper test:
+- `dev.sh layer-count` — runs `$ADB logcat -d | grep "VrApi" | tail -3`, extracts the latest `LCnt=N`, prints `LCnt=N` to stdout, exits 0 if N parsed OK. (Composes with `dev.sh logs` but is the single canonical layer-count probe so steps can declare expected values.)
+- `dev.sh alive-for <seconds>` — polls `pidof` every 1 s for the requested duration; exits 0 if PID is stable and non-empty the entire interval, exits 1 with the offending sample on any drop. (Replaces ad-hoc `sleep 15 && pidof` patterns; the marker test currently only checks pidof once.)
+- `dev.sh verify-color` — already exists, but extend `dev_verify_color.py` to accept an optional `--left COLOR --right COLOR` for asymmetric stereo checks. (It already does — confirmed in source — so this part is just documenting the contract for the steps below.)
+- `scripts/tests/test_stereo_panel.sh` — wraps build + install-app + run-app + alive-for + screencap + verify-color with per-eye colors as args. Mirror of `test_marker.sh` but for compositor panel runs.
+
+**Builds on:** the existing canonical state machine (begin-automation / install-app / run-app / kill-app) and the marker test's pattern.
+
+**Auto-confirm method:**
+- `dev.sh test marker green` still passes (regression guard — we did not break the working baseline).
+- `dev.sh layer-count` against the running marker app prints a number ≥ 3 (baseline; without our panel this is typically 5 per the journal).
+- `dev.sh alive-for 10` against the running marker app exits 0.
+
+**Failure-mode disambiguation:** if `test marker` regresses after the verb additions, the bug is in `dev.sh` shell — the new verbs must not alter argument parsing of existing verbs. Re-check the dispatch case block first.
+
+**Estimated loop iterations:** 1–2 (mostly mechanical script edits).
+
+---
+
+#### Step 2 — Rebuild today's stable repro of the SEGV with full diagnostic context
+
+**Goal:** before bisecting, capture a clean, full-fidelity repro of the current LODGroup crash so we can tell whether subsequent steps actually changed anything.
+
+**Change:** code-only — flip the panel back on for one build (`STEREO_SKIP_PANEL=0`) and add three temporary `Debug.Log` calls in `StereoCompositorSceneSetup.cs` and `StereoCompositorFeature.cs`: one before `panel.AddComponent<CompositionLayer>()`, one inside `OnLayerProviderStarted`, one inside `StereoQuadLayerHandler.SetActiveLayer`. (Several of these already exist; just ensure each prints a unique `[REPRO-N]` tag so we can grep them.) Keep `TestPurpleCircleSetup` enabled — the green disc is our "is the URP path alive at all" canary.
+
+**Builds on:** Step 1's `alive-for` and `layer-count` verbs.
+
+**Auto-confirm method:**
+- `STEREO_SKIP_PANEL=0 dev.sh build` succeeds.
+- `dev.sh install-app && dev.sh run-app` reports launch.
+- `dev.sh alive-for 10` **fails** (this is the expected SEGV repro).
+- `dev.sh crash-stack` shows `LODGroupManager::GarbageCollectCameraLODData` in the backtrace.
+- `dev.sh logs '\[REPRO-'` shows REPRO-1 (panel authored) and REPRO-2 (LayerProvider started); REPRO-3 (SetActiveLayer) presence/absence tells us whether the crash is before or after the handler ran — that's the diagnostic we don't have today.
+- `dev.sh tag segv-baseline` snapshots all artifacts.
+
+**Failure-mode disambiguation:**
+1. If `alive-for 10` passes (no crash): the SEGV has self-resolved (Quest OS or device-state-pollution change). Stop the plan, re-evaluate; just enable the panel by default and proceed to Step 4.
+2. If REPRO-1 doesn't appear: the editor scene-authoring path is broken (probably an asmdef regression). Check `/tmp/quest_build.log` for `[StereoCompositorSceneSetup]`.
+3. If the crash backtrace is *not* LODGroup: the SEGV moved. That's actually a useful signal for Step 3 — note it and re-tag.
+
+**Estimated loop iterations:** 1.
+
+---
+
+#### Step 3 — Eliminate LODGroup interaction (likely SEGV root cause)
+
+**Goal:** test the hypothesis that the SEGV is `LODGroupManager` walking GameObjects/Cameras during scene cleanup and choking on the CompositionLayer GameObject specifically. The journal's older bisects all stayed *inside* `StereoQuadLayerData` (fields, attributes, link.xml). The new crash signature (`LODGroupManager::GarbageCollectCameraLODData`) is somewhere else entirely — it's about camera lifecycle, not LayerData type identity.
+
+**Change:** in `StereoCompositorSceneSetup.cs`, after creating the panel GameObject:
+- Set `panel.layer` to a dedicated layer (e.g. `IgnoreRaycast` or a new "CompositorLayers" layer) so URP's per-camera culling treats it deterministically.
+- Remove anything that could attach an LODGroup component traversal: no children, no MeshRenderer/MeshFilter (CompositionLayer alone). Verify with `panel.GetComponents<Component>()` log: should be `Transform, CompositionLayer, TexturesExtension`.
+- Pin the display refresh rate to 72 Hz on session start by adding a small `MonoBehaviour` in the scene (`PinRefreshRate`) that calls `OVRManager.display?.displayFrequency = 72f;` in `Start()`. The journal flagged 72→90→72 oscillations as crash-trigger-adjacent. Pinning removes one variable.
+
+**Builds on:** Step 2's `[REPRO-N]` markers tell us whether the panel even gets to `SetActiveLayer` before crashing.
+
+**Auto-confirm method:**
+- `dev.sh build && dev.sh install-app && dev.sh run-app && dev.sh alive-for 15` exits 0 (no crash for 15 s = SEGV likely fixed).
+- `dev.sh layer-count` reports LCnt=6 (one above the marker baseline of 5 — our panel layer is being submitted).
+- `dev.sh logs 'displayFrequency'` shows 72 Hz pinned.
+- `dev.sh logs 'StereoQuadLayerHandler.*SetActiveLayer'` matches at least once.
+- `dev.sh tag step3-layer-pinned`.
+
+**Failure-mode disambiguation (in order, before assuming Step 3 didn't work):**
+1. CLAUDE.md "Visual confirmation" #1: device awake? `dev.sh screencap` returns >10 KB? If not, the screencap is silent-failing, not the panel.
+2. CLAUDE.md #2: app actually running? `dev.sh pidof` non-empty? If empty, crash → `dev.sh crash-stack`. New backtrace OR same? If still LODGroup, the layer/camera changes didn't help. If different (e.g. URP RenderPass null), Tier 4 (device reboot) territory.
+3. If alive but `layer-count` is still 5, the panel exists but isn't being submitted — handler not registered. Check Step 1's `[REPRO-2]` log.
+4. If the crash moved to `Resources.FindObjectsOfTypeAll<CompositionLayer>` (the OLD signature from the bisect log), Step 3 didn't help and we need Step 3b.
+
+**Estimated loop iterations:** 2–4.
+
+---
+
+#### Step 3b — (Conditional) Move to direct `ILayerHandler` if Step 3 didn't fix the SEGV
+
+**Goal:** apply path (A) from the original architect doc — bypass `OpenXRCustomLayerHandler<XrCompositionLayerQuad>` and implement `OpenXRLayerProvider.ILayerHandler` directly. Only run this step if Step 3's auto-confirm fails on the SEGV after at least 3 iterations of in-step debugging.
+
+**Change:** new file `Assets/Scripts/StereoVideoCompositor/StereoQuadLayerHandlerDirect.cs` implementing the 5 `ILayerHandler` methods (`OnUpdate`, `CreateLayer`, `RemoveLayer`, `ModifyLayer`, `SetActiveLayer`). Delete or `#if false` the existing `StereoQuadLayerHandler.cs`. Update `StereoCompositorFeature.OnLayerProviderStarted` to register the new type. Mirror the swapchain-create/blit lifecycle from `OpenXRQuadLayer.cs` (`Library/PackageCache/com.unity.xr.openxr@.../Runtime/CompositionLayers/OpenXRQuadLayer.cs`) — no shared static state.
+
+**Builds on:** Step 3's diagnostic logs proving the crash is upstream of our handler logic.
+
+**Auto-confirm method:**
+- Same as Step 3: `alive-for 15` + `layer-count` ≥ 6 + handler `SetActiveLayer` log appears.
+
+**Failure-mode disambiguation:** if SEGV persists with the `ILayerHandler`-direct path AND the crash is still in `LODGroupManager`/`FindObjectsByType`, then the framework's GameObject enumeration is the proximate cause. Escalate to Tier 5 — file the Unity bug (path C), pivot to OVROverlay (path B) for the rest of the plan, and document the pivot in this file.
+
+**Estimated loop iterations:** 4–6 (only if needed).
+
+---
+
+#### Step 4 — Reposition the panel under `OVRCameraRig.trackingSpace`
+
+**Goal:** the existing `StereoCompositorSceneSetup.cs` puts the panel at world `(0, 1.5, 1.5)`. The marker test proved the device sits low (~0.8 m head height) and only sees things parented under `OVRCameraRig.trackingSpace` at local `(0, 0, 1)`. Without this fix, even a non-crashing panel won't be in the screencap.
+
+**Change:** in `StereoCompositorSceneSetup.cs`, parent the panel under `OVRCameraRig.trackingSpace` (with a `OVRCameraRig` fallback, then world fallback — same pattern as `TestPurpleCircleSetup.cs`). Set `localPosition = (0, 0, 1.5)`, `localRotation = Euler(0, 180, 0)`.
+
+**Builds on:** Step 3 (or 3b) — panel is alive on device.
+
+**Auto-confirm method:**
+- `dev.sh screencap && dev.sh verify-color red red` — both eyes show red (the `BuildTestPattern` paints the top half red, bottom blue; if the layer is rendering Mono / both-eyes-same and showing the top half by default, both eyes are red). This is intentionally a low bar — Step 5 makes it stricter.
+- `dev.sh logs 'StereoCompositorSceneSetup.*Authored'` shows the new parent name `OVRCameraRig/TrackingSpace`.
+- `dev.sh tag step4-panel-positioned`.
+
+**Failure-mode disambiguation:**
+1. CLAUDE.md "Visual confirmation" 1–4 (device awake / app running / layer submitted / panel in view).
+2. If `verify-color` returns near-black `(0,0,0)`: the layer is being submitted but at a transparent or off-screen position. Re-check the localPosition/rotation, and inspect `dev.sh logs 'StereoQuadLayerHandler.*CreateNativeLayer'` for the Pose values being computed.
+3. If `verify-color` returns mostly green (the marker disc): the panel is behind / smaller than the disc. Either remove the disc for this step (set `TEST_PURPLE_CIRCLE=0`) or move the panel to `(0, 0, 1.0)` (closer than the disc).
+
+**Estimated loop iterations:** 1–2.
+
+---
+
+#### Step 5 — Confirm true stereo split (left eye ≠ right eye)
+
+**Goal:** the test pattern is red-top / blue-bottom. With `StereoLayout.TopBottom` and our handler computing per-eye `SubImage.ImageRect`, the left eye should show red, the right should show blue. This is the first step that proves the entire stereo compositor pipeline end-to-end.
+
+**Change:** in `StereoCompositorSceneSetup.cs`, ensure `data.StereoLayout = StereoLayout.TopBottom` (default already, but make it explicit). Disable the green marker disc for this step's build by setting `TEST_PURPLE_CIRCLE=0` in the test script — the disc is in URP world space and renders into both eyes from the same Camera, masking the stereo split. (Alternative: leave the disc on and verify-color in the *upper* portion of each eye where the panel is, but per-eye pixel sampling at the panel center is cleaner.)
+
+**Builds on:** Step 4's correctly-positioned panel.
+
+**Auto-confirm method:**
+- `TEST_PURPLE_CIRCLE=0 dev.sh build && dev.sh install-app && dev.sh run-app`.
+- `dev.sh screencap && dev.sh verify-color red blue` — left eye center matches red `(220,30,30)±60`, right eye center matches blue `(30,30,220)±60`.
+- `dev.sh layer-count` reports LCnt=6 (the panel's two per-eye Quad submissions only count as one logical layer in `LCnt`; if the handler is doubling submissions, LCnt may be 7 — note actual value as Step-5 baseline).
+- `dev.sh tag step5-stereo-split-verified`.
+
+**Failure-mode disambiguation:**
+1. CLAUDE.md visual checks 1–5 first.
+2. If both eyes show red: `EyeVisibility=0` (mono) — handler isn't differentiating. Check `dev.sh logs 'StereoQuadLayerHandler.*OnUpdate'` for left/right rect values.
+3. If both eyes show blue: TB orientation flipped. Swap the leftRect/rightRect Y offsets in `ComputeEyeRects` (the Y=0-at-bottom convention may differ from what Quest's Vulkan layer sampler expects).
+4. If left=red but right=red (or both=blue): `EyeVisibility` not being honored — check that the handler is emitting TWO Quad submissions per frame, not one.
+5. If neither eye is the expected color but they do differ: texture import broken (sRGB conversion?) — check `StereoTestPattern.png` import settings haven't drifted from `sRGBTexture=false`.
+
+**Estimated loop iterations:** 2–4.
+
+---
+
+#### Step 6 — Replace the procedural test pattern with a clearly-stereo PNG asset
+
+**Goal:** swap the procedural red-top/blue-bottom pattern for an asset under `Assets/StereoCompositor/` containing per-eye distinguishable shapes (e.g. left half/top half = "L" glyph or a circle in upper-left; right half/bottom half = "R" glyph or a circle in lower-right). Catches stereo-orientation bugs that two solid colors can't.
+
+**Change:** in `StereoCompositorSceneSetup.cs`, modify `BuildTestPattern` to render distinct shapes per half (already partially done — there's a white square and a yellow square at known coords). Move those markers to fixed corner positions: white square in top-left of the top half, yellow square in bottom-right of the bottom half. This makes the per-eye shape diagnostically meaningful.
+
+**Builds on:** Step 5's verified stereo split. With true stereo, the left eye shows ONLY the white square at top-left; the right eye shows ONLY the yellow square at bottom-right.
+
+**Auto-confirm method:**
+- `dev.sh verify-color red blue` still passes (color match unchanged — the markers are tiny vs the full red/blue field).
+- New verb in `dev_verify_color.py`: optional `--left-marker COLOR@X,Y` flag that samples a specific pixel coord in the left half. Run `dev.sh verify-color red blue --left-marker white@0.25,0.25 --right-marker yellow@0.75,0.75`. Expected: pass.
+- `dev.sh tag step6-stereo-shape-distinguishable`.
+
+**Failure-mode disambiguation:**
+1. If markers don't show but solid colors are correct: texture filter mode = Bilinear is blurring the small squares — should be Point (already enforced by importer code in `EnsureTestPatternAsset`). Verify.
+2. If markers appear in BOTH eyes: stereo split regressed; back to Step 5 disambiguation.
+
+**Estimated loop iterations:** 2.
+
+---
+
+#### Step 7 — Re-enable the green marker disc as a "URP + compositor coexistence" check
+
+**Goal:** prove URP world-space content (the marker disc) and our compositor layer can coexist in the same scene without one breaking the other. Today's testing has them in separate builds (`STEREO_SKIP_PANEL` toggles) — we need them simultaneously stable before adding more layers.
+
+**Change:** flip `TEST_PURPLE_CIRCLE=1` (default) AND keep the panel enabled. Position the disc at local `(0.6, 0, 1.5)` (offset right) and the panel at local `(-0.6, 0, 1.5)` (offset left) so they don't overlap in either eye.
+
+**Builds on:** Step 6 known-good stereo split.
+
+**Auto-confirm method:**
+- `dev.sh alive-for 15` exits 0.
+- `dev.sh layer-count` reports the same LCnt as Step 5 (compositor layer count unchanged — disc is URP not compositor).
+- `dev.sh verify-color` with a left-half AND right-half region split: left-eye-left-region = red, right-eye-left-region = blue, both eyes' right-region = green (the disc, rendered via URP into both eye buffers — same color in both eyes since it's URP not stereo-compositor). This requires extending `dev_verify_color.py` to sample multiple regions; treat the extension as part of this step's scope.
+- `dev.sh tag step7-coexistence`.
+
+**Failure-mode disambiguation:**
+1. If alive-for fails (regression): the disc + panel combination triggers a new crash. Bisect by running disc-only (Step 4 baseline, marker test) and panel-only (Step 6 baseline) separately to confirm each is still alive. The combination probably exposes a renderer-ordering bug; check URP camera clear flags.
+2. If the disc renders red/blue (i.e., disc taking on panel colors): the compositor layer is drawing OVER the disc with EyeVisibility=0 mono — Step 5 stereo regression.
+
+**Estimated loop iterations:** 2.
+
+---
+
+#### Step 8 — Promote `StereoCompositorSceneSetup` defaults to "panel ON" in dev.sh build
+
+**Goal:** flip the default — `dev.sh build` (no env vars) should now produce a build with the panel enabled. This locks in the "stable single-quad stereo panel" milestone.
+
+**Change:** in `scripts/dev.sh verb_build`, change the default from `STEREO_SKIP_PANEL=${STEREO_SKIP_PANEL:-1}` to `STEREO_SKIP_PANEL=${STEREO_SKIP_PANEL:-0}`. Update `scripts/tests/test_marker.sh` to pass `STEREO_SKIP_PANEL=1` explicitly (so the marker test still skips the panel). Add a `scripts/tests/test_stereo_panel.sh` (created in Step 1) that exercises the panel-on path as the canonical compositor regression test.
+
+**Builds on:** Step 7's verified panel+disc coexistence.
+
+**Auto-confirm method:**
+- `dev.sh test marker green` still passes (it forces the env var, so unaffected).
+- `dev.sh test stereo-panel` — new test: build with panel on, install, run, alive-for 15, screencap, verify-color red blue. Should pass.
+- Both tests pass back-to-back in one session (no device reboot between them).
+- `dev.sh tag milestone-stable-stereo-panel`.
+
+**Failure-mode disambiguation:** if `test stereo-panel` fails but the same build manually steps through (Step 7) succeed: the test script wrapper has a timing issue. Compare with `test_marker.sh`'s timing.
+
+**Estimated loop iterations:** 1.
+
+---
+
+#### Step 9 — Add `BlendType.Premultiply` configuration option to the panel and verify alpha behavior
+
+**Goal:** before introducing the AndroidSurface video and the FB alpha-blend extension, verify the panel respects `LayerFlags.UnPremultipliedAlpha` vs `SourceAlpha`. We need this controlled before stacking layers; otherwise we'll chase ghost alpha bugs in the mask layer later.
+
+**Change:** in the test pattern, replace the bottom (right-eye) blue with semi-transparent blue `(30,30,220,128)`. The texture import already has `alphaIsTransparency=false` (good — that means alpha is straight). Run two builds, one each with `BlendType.Premultiply` and `BlendType.Alpha` on the `StereoQuadLayerData`'s LayerData.BlendType (the field is set on the base class). Compare which produces correct-looking blending against the passthrough background.
+
+**Builds on:** Step 8's stable panel.
+
+**Auto-confirm method:**
+- `BlendType.Alpha` build: `dev.sh verify-color red '60,60,140'` (right eye should be ~50% blue mixed with passthrough gray; the exact RGB depends on passthrough background but should NOT be pure blue or pure black).
+- `BlendType.Premultiply` build: right-eye RGB will differ. Record both results — this step's "pass" is having BOTH builds alive and producing different right-eye RGBs in a documented way (the choice of which blend type to use long-term is a Step 11+ concern).
+- `dev.sh tag step9-blend-alpha` and `dev.sh tag step9-blend-premultiply`.
+
+**Failure-mode disambiguation:**
+1. If both builds produce identical RGBs: the `LayerFlags` aren't being honored — check `CreateNativeLayer` actually reads `data.BlendType`.
+2. If alpha=128 still shows fully opaque: texture importer is forcing alpha to 1.0 — re-check `alphaIsTransparency=false` and `sRGBTexture=false`.
+
+**Estimated loop iterations:** 2.
+
+---
+
+#### Step 10 — Swap the `LocalTexture` source for an `AndroidSurface`-driven render target (NO ExoPlayer yet)
+
+**Goal:** prove our handler can drive an AndroidSurface swapchain — the same path ExoPlayer will write into — without any video plumbing. Render into the surface from a tiny Java helper that just clears it to a known color every 100 ms.
+
+**Change:**
+- Extend `StereoQuadLayerData` to support `SourceTextureEnum.AndroidSurface` (likely already wired through TexturesExtension; the handler's `CreateSwapchain` needs `isExternalSurface: true` when the extension's source is AndroidSurface).
+- Add `Assets/Plugins/Android/SurfaceClearer.java`: takes a `Surface`, runs an `EGL` thread that clears to `Color.argb(255, 0, 200, 0)` (green) every 100 ms.
+- Modify `StereoCompositorFeature` (or a new `StereoSurfaceBinder` MonoBehaviour) to subscribe to the surface-ready callback and pass the `Surface` to `SurfaceClearer`.
+
+**Builds on:** Step 9's verified blend behavior — we know the panel is composing alpha correctly, so any color shift in this step is from the surface, not blending.
+
+**Auto-confirm method:**
+- `dev.sh alive-for 30` exits 0 (longer than usual — Surface lifecycle is an async race).
+- `dev.sh verify-color green green` — both eyes show green (no per-eye difference; AndroidSurface here is mono — single fullscreen content).
+- `dev.sh logs 'GetLayerAndroidSurfaceObject'` shows the callback firing with a non-null surface object.
+- `dev.sh logs 'SurfaceClearer'` shows clear loop running.
+
+**Failure-mode disambiguation:**
+1. If `verify-color` shows red/blue (the static texture pattern): the SourceTexture switch didn't take effect; the panel is still on `LocalTexture`. Verify the scene's TexturesExtension.sourceTexture serialization.
+2. If both eyes black: `SurfaceClearer` thread crashed or surface wasn't passed. Check `adb logcat | grep SurfaceClearer` for Java exceptions.
+3. If alive-for fails: AndroidSurface async race fired before our callback subscribed. Subscribe BEFORE `Layer.SetActive`, not after.
+
+**Estimated loop iterations:** 3–6 (this is the riskiest single step).
+
+---
+
+#### Step 11 — Single-quad mono HLS playback via existing ExoPlayerBridge
+
+**Goal:** point ExoPlayer at the AndroidSurface-driven panel from Step 10, with a known-good HLS URL (the `Main_Final_8m_hardmasked_nvenc_tb_20Mbps/index.m3u8` from `StereoVideoManager.cs`). Mono playback for now — both eyes show the same TB frame, no per-eye split. Mask + per-eye stereo are deliberately deferred.
+
+**Change:** refactor `Assets/Plugins/Android/ExoPlayerBridge.java` to take a `Surface` directly instead of building one from `SurfaceTexture` (per the journal's "What gets deleted" section). Replace `SurfaceClearer` from Step 10 with the ExoPlayerBridge in `StereoSurfaceBinder`. Set `StereoQuadLayerData.StereoLayout = Mono` for this step.
+
+**Builds on:** Step 10's verified Surface plumbing.
+
+**Auto-confirm method:**
+- `dev.sh alive-for 60` exits 0 (full minute — exercises HLS startup, segment download, decoder init).
+- `dev.sh logs 'ExoPlayer.*onPlayerStateChanged.*STATE_READY'` matches at least once.
+- `dev.sh verify-color` — pick a region known to be opaque in the source video (e.g. center) and verify the RGB is plausible (not black, not all-gray). Add a `--not-black` flag to `dev_verify_color.py` for "any RGB > (10,10,10) average" passes. Both eyes get the same color (mono).
+- `dev.sh tag step11-mono-hls`.
+
+**Failure-mode disambiguation:**
+1. If verify-color is black: HLS not playing. Check ExoPlayer state logs. If `STATE_READY` never fires, network/codec issue — independent of compositor.
+2. If verify-color is bright green/blue (not video pixels): the `SurfaceClearer` is still running (cleanup from Step 10 missed). Force-stop the app, uninstall, reinstall.
+
+**Estimated loop iterations:** 4–8 (multi-day work; ExoPlayer surface refactor is non-trivial but well-scoped).
+
+---
+
+#### Step 12 — Re-enable `StereoLayout.TopBottom` per-eye split on the HLS panel
+
+**Goal:** combine Step 5 (stereo split) and Step 11 (HLS into AndroidSurface). The HLS stream is encoded TB, so the handler's per-eye `SubImage.ImageRect` should naturally produce correct stereo without re-encoding.
+
+**Change:** in `StereoCompositorSceneSetup.cs`, set `data.StereoLayout = StereoLayout.TopBottom`. No code change in the handler — `ComputeEyeRects` already handles TopBottom. The source texture's dimensions are now whatever the HLS stream is (e.g. 3840×4320 for the Main_Final stream).
+
+**Builds on:** Step 11's working HLS, Step 5's working TB split.
+
+**Auto-confirm method:**
+- `dev.sh alive-for 60` exits 0.
+- `dev.sh verify-color` — both eyes show "video" (non-black average), AND left/right RGB averages **differ by at least 30 per channel** in at least one channel. This requires another `dev_verify_color.py` extension: `--require-asymmetric` flag. The exact colors are stream-dependent so we can't hard-code them; asymmetry is the contract.
+- `dev.sh tag step12-stereo-hls`.
+
+**Failure-mode disambiguation:** as Step 5 — both eyes identical means TB split regressed; back to `EyeVisibility` / handler emission count diagnostic.
+
+**Estimated loop iterations:** 1–3.
+
+---
+
+### Milestone summary
+
+After Step 12, the project has a working stereo HLS compositor panel, with: (a) a stable per-eye split, (b) AndroidSurface-driven swapchain, (c) ExoPlayer feeding it, (d) blend type validated, (e) coexisting cleanly with URP. **This is the "working stereo video compositor panel" the user asked for.** The mask layer, the overlay layer, the FB alpha-blend extension, and the three-panel zIndex topology from the native Spatial SDK reference are all *additive* on top of this substrate and are deferred to a follow-up plan.
+
+### What this plan deliberately defers
+
+- **The mask layer + `XR_FB_composition_layer_alpha_blend` extension wiring.** These need their own incremental plan once the substrate is stable; Step 9 establishes that we have the alpha-blend understanding to do them, but the plan doesn't actually wire them.
+- **The overlay layer + `setClip` per-eye UV rects.** Same reason.
+- **Specific HLS configurations beyond the Main_Final test stream.** The journal lists `videoUrl` and `maskUrl` constants in `StereoVideoManager.cs`; we use those as-is.
+- **Audio.** ExoPlayer plays audio by default; the plan doesn't gate on audio working but doesn't disable it. If the user wants a separate audio milestone, it's a one-step add later.
+- **App/package rename** (`com.UnityTechnologies.com.unity.template.urpblank` → `com.Quintar.VibeUnity.ExoTest`). Day 7 of the older plan; orthogonal.
+- **Performance tuning.** No Unity render passes for video pixels (the journal flags this as a Day 7 concern); compositor-layer-only is automatic via this plan, but explicit perf measurement is deferred.
+- **Pause/resume + ExoPlayer lifecycle edge cases.** The plan's `alive-for` checks are 15–60 s; longer-lived robustness is deferred.
+- **Filing the Unity bug** (path C from the original architect doc) — only run if Step 3b (`ILayerHandler` direct) also fails to fix the SEGV.
+
+---
+
 ## STATE AT HANDOFF — START HERE FOR A NEW SESSION
 
 **Repo:** `richoncode/Unity` (https://github.com/richoncode/Unity, public).

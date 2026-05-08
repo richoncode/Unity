@@ -212,17 +212,23 @@ verb_init() {
     done
 
     note "--- keep-awake (persistent settings + setprops):"
-    local VR; VR=$($ADB shell settings get secure vr_sensor_state | tr -d '\r')
-    local TO; TO=$($ADB shell settings get system screen_off_timeout | tr -d '\r')
-    local SP; SP=$($ADB shell getprop debug.oculus.skipProxBlanking | tr -d '\r')
-    local AO; AO=$($ADB shell getprop debug.oculus.alwaysOn | tr -d '\r')
+    local VR;  VR=$($ADB shell settings get secure vr_sensor_state | tr -d '\r')
+    local TO;  TO=$($ADB shell settings get system screen_off_timeout | tr -d '\r')
+    local SP;  SP=$($ADB shell getprop debug.oculus.skipProxBlanking | tr -d '\r')
+    local AO;  AO=$($ADB shell getprop debug.oculus.alwaysOn | tr -d '\r')
+    local SLC; SLC=$($ADB shell settings get secure skip_launch_check_requires_controllers_enabled | tr -d '\r')
+    local CEM; CEM=$($ADB shell settings get secure controller_emulation_mode | tr -d '\r')
     note "  vr_sensor_state=$VR  screen_off_timeout=$TO  skipProxBlanking=$SP  alwaysOn=$AO"
+    note "  skip_launch_check=$SLC  controller_emulation=$CEM"
     # Setprops are volatile (cleared on reboot / system_server restart) so
     # init must verify them, not just the persistent settings — otherwise we
     # report "already in keep-awake state" while the load-bearing
     # skipProxBlanking is 0 and the device blanks on the next prox event.
+    # Also verify the controller-dialog suppression settings — without
+    # those, run-app gets redirected to the controller-required dialog.
     if [ "$VR" != "0" ] || [ "$TO" -lt 86400000 ] 2>/dev/null \
-        || [ "$SP" != "1" ] || [ "$AO" != "1" ]; then
+        || [ "$SP" != "1" ] || [ "$AO" != "1" ] \
+        || [ "$SLC" != "true" ] || [ "$CEM" != "1" ]; then
         note "  not in keep-awake state — applying"
         verb_keep_awake_on
     else
@@ -288,56 +294,86 @@ verb_reboot_recover() {
 verb_wake()           { "$SCRIPTS_DIR/dev_wake.sh"; }
 
 verb_keep_awake_on() {
-    step "keep-awake ON (persistent settings)"
+    step "keep-awake ON (device state for headless automation)"
     # Save original values once per session so 'off' can restore them.
+    # All four settings flip together — capture them all on first apply.
     if [ ! -f "$SETTINGS_BACKUP" ]; then
-        local VR; VR=$($ADB shell settings get secure vr_sensor_state | tr -d '\r')
-        local TO; TO=$($ADB shell settings get system screen_off_timeout | tr -d '\r')
-        printf 'vr_sensor_state=%s\nscreen_off_timeout=%s\n' "$VR" "$TO" > "$SETTINGS_BACKUP"
-        note "saved originals to $SETTINGS_BACKUP: vr_sensor_state=$VR screen_off_timeout=$TO"
+        local VR;  VR=$($ADB shell settings get secure vr_sensor_state | tr -d '\r')
+        local TO;  TO=$($ADB shell settings get system screen_off_timeout | tr -d '\r')
+        local SLC; SLC=$($ADB shell settings get secure skip_launch_check_requires_controllers_enabled | tr -d '\r')
+        local CEM; CEM=$($ADB shell settings get secure controller_emulation_mode | tr -d '\r')
+        printf 'vr_sensor_state=%s\nscreen_off_timeout=%s\nskip_launch_check_requires_controllers_enabled=%s\ncontroller_emulation_mode=%s\n' \
+            "$VR" "$TO" "$SLC" "$CEM" > "$SETTINGS_BACKUP"
+        note "saved originals to $SETTINGS_BACKUP: vr_sensor_state=$VR screen_off_timeout=$TO skip_launch_check_requires_controllers_enabled=$SLC controller_emulation_mode=$CEM"
     fi
-    # Quest dev properties (the load-bearing ones for off-head use).
-    # skipProxBlanking is what MQDH "Disable Proximity Sensor" actually sets
-    # — without it, Quest blanks the screen the moment the proximity sensor
-    # reads "off head", regardless of any other setting.
+    # Quest dev properties (volatile — wiped on reboot). skipProxBlanking
+    # is what MQDH "Disable Proximity Sensor" actually sets — without it,
+    # Quest blanks the screen the moment the proximity sensor reads "off
+    # head", regardless of any other setting.
     $ADB shell setprop debug.oculus.skipProxBlanking 1
     $ADB shell setprop debug.oculus.alwaysOn 1
 
-    # Sensor-level disable + Android idle defeats.
+    # Persistent settings (survive reboot).
+    # - vr_sensor_state=0 + screen_off_timeout=long: never sleep.
+    # - skip_launch_check_requires_controllers_enabled=true +
+    #   controller_emulation_mode=1: bypass the controller-required
+    #   launch interceptor so `am start` of a VR app proceeds without
+    #   redirecting to LaunchCheckControllerRequiredDialogActivity.
+    #   Both are needed; the skip flag alone doesn't suppress the dialog
+    #   without an emulated controller present.
     $ADB shell settings put secure vr_sensor_state 0
     $ADB shell settings put system screen_off_timeout 999999999
+    $ADB shell settings put secure skip_launch_check_requires_controllers_enabled true
+    $ADB shell settings put secure controller_emulation_mode 1
     $ADB shell svc power stayon true 2>/dev/null || true
     $ADB shell settings put global stay_on_while_plugged_in 7 2>/dev/null || true
 
     # Spoof "covered" so the runtime starts a VR session immediately.
     $ADB shell am broadcast -a com.oculus.vrpowermanager.prox_close >/dev/null 2>&1 || true
 
-    note "applied: skipProxBlanking=$($ADB shell getprop debug.oculus.skipProxBlanking | tr -d '\r') alwaysOn=$($ADB shell getprop debug.oculus.alwaysOn | tr -d '\r') vr_sensor_state=$($ADB shell settings get secure vr_sensor_state | tr -d '\r') screen_off_timeout=$($ADB shell settings get system screen_off_timeout | tr -d '\r')"
+    # vrshell caches the launch-check policy; force it to reload by
+    # killing it once. This is a one-shot at state-transition time, NOT
+    # an ongoing daemon — re-applying keep-awake-on later does the same
+    # thing once and stops.
+    $ADB shell am force-stop com.oculus.vrshell 2>/dev/null || true
+
+    note "applied: skipProxBlanking=$($ADB shell getprop debug.oculus.skipProxBlanking | tr -d '\r') alwaysOn=$($ADB shell getprop debug.oculus.alwaysOn | tr -d '\r') vr_sensor_state=$($ADB shell settings get secure vr_sensor_state | tr -d '\r') screen_off_timeout=$($ADB shell settings get system screen_off_timeout | tr -d '\r') skip_launch_check=$($ADB shell settings get secure skip_launch_check_requires_controllers_enabled | tr -d '\r') controller_emulation=$($ADB shell settings get secure controller_emulation_mode | tr -d '\r')"
 }
 
 verb_keep_awake_off() {
-    step "keep-awake OFF (restore originals)"
+    step "keep-awake OFF (restore device defaults)"
     # Clear the Quest dev properties.
     $ADB shell setprop debug.oculus.skipProxBlanking 0
     $ADB shell setprop debug.oculus.alwaysOn 0
     if [ -f "$SETTINGS_BACKUP" ]; then
         # shellcheck source=/dev/null
         . "$SETTINGS_BACKUP"
-        # If original was "null" (unset on this OS version), put 1 (default-ish).
+        # If original was "null" (unset on this OS version), pick a sane
+        # default and continue.
         local VR_RESTORE="${vr_sensor_state:-1}"
         [ "$VR_RESTORE" = "null" ] && VR_RESTORE=1
         local TO_RESTORE="${screen_off_timeout:-86400000}"
         [ "$TO_RESTORE" = "null" ] && TO_RESTORE=86400000
+        local SLC_RESTORE="${skip_launch_check_requires_controllers_enabled:-false}"
+        [ "$SLC_RESTORE" = "null" ] && SLC_RESTORE=false
+        local CEM_RESTORE="${controller_emulation_mode:-0}"
+        [ "$CEM_RESTORE" = "null" ] && CEM_RESTORE=0
         $ADB shell settings put secure vr_sensor_state "$VR_RESTORE"
         $ADB shell settings put system screen_off_timeout "$TO_RESTORE"
-        note "restored: vr_sensor_state=$VR_RESTORE screen_off_timeout=$TO_RESTORE skipProxBlanking=0 alwaysOn=0"
+        $ADB shell settings put secure skip_launch_check_requires_controllers_enabled "$SLC_RESTORE"
+        $ADB shell settings put secure controller_emulation_mode "$CEM_RESTORE"
+        note "restored: vr_sensor_state=$VR_RESTORE screen_off_timeout=$TO_RESTORE skip_launch_check=$SLC_RESTORE controller_emulation=$CEM_RESTORE skipProxBlanking=0 alwaysOn=0"
     else
         # No backup — set safe defaults.
         $ADB shell settings put secure vr_sensor_state 1
         $ADB shell settings put system screen_off_timeout 86400000
-        note "no backup file; set defaults vr_sensor_state=1 screen_off_timeout=86400000 skipProxBlanking=0 alwaysOn=0"
+        $ADB shell settings put secure skip_launch_check_requires_controllers_enabled false
+        $ADB shell settings put secure controller_emulation_mode 0
+        note "no backup file; set defaults vr_sensor_state=1 screen_off_timeout=86400000 skip_launch_check=false controller_emulation=0 skipProxBlanking=0 alwaysOn=0"
     fi
     $ADB shell am broadcast -a com.oculus.vrpowermanager.automation_disable >/dev/null 2>&1 || true
+    # Reload vrshell so it picks up the restored settings.
+    $ADB shell am force-stop com.oculus.vrshell 2>/dev/null || true
 }
 
 # Legacy verb aliases.

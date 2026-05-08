@@ -14,29 +14,41 @@ ADB_BIN="${ADB%% *}"  # bare adb path (no -s SERIAL) for daemon-management calls
 
 step() { printf '\n>>>>>>>>>>>>>>>>>>>>  %s  ::  %s  <<<<<<<<<<<<<<<<<<<<\n\n' "$(date '+%H:%M:%S')" "$1"; }
 
-# robust_pidof: pidof with one auto-retry through `adb start-server` if the
-# adb daemon dies mid-flight. The daemon dies semi-randomly on this Mac
-# (Homebrew/Unity/Android Studio adb binaries race for port 5037). We've
-# observed this fail in practice between PID(t=0) and PID(t+3s) checks,
-# producing a false "app not running" result.
+# robust_pidof: pidof with one auto-retry through `adb start-server` only
+# when the adb daemon itself died mid-flight. The daemon dies semi-randomly
+# on this Mac (Homebrew/Unity/Android Studio adb binaries race for port
+# 5037). We've observed this fail in practice between PID(t=0) and
+# PID(t+3s) checks, producing a false "app not running" result.
 #
-# Distinguishes "adb itself errored" (non-zero exit + stderr message) from
-# "process not running" (zero exit + empty stdout) — only retries the former.
+# Distinguishes the failure modes by stderr CONTENT (not just exit code,
+# because `adb shell pidof <not-running>` also exits 1 with empty stderr —
+# which is a normal "process not running" signal, not an adb fault):
+#   - stderr contains "protocol fault" / "daemon" / "Connection reset" /
+#     "cannot connect" → adb daemon issue, retry
+#   - any other failure (including empty stderr) → process not running,
+#     return empty PID without retry
 robust_pidof() {
-    local out errfile rc
+    local out errfile rc err
     for attempt in 1 2; do
         errfile=$(mktemp /tmp/robust_pidof.err.XXXXXX)
         out=$($ADB shell pidof "$PKG" 2>"$errfile")
         rc=$?
+        err=$(cat "$errfile")
+        rm -f "$errfile"
         if [ $rc -eq 0 ]; then
-            rm -f "$errfile"
             printf '%s' "$out" | tr -d '\r' | tr -d ' '
             return 0
         fi
-        echo "[harden] pidof attempt $attempt failed ($(head -1 "$errfile" 2>/dev/null)); restarting adb daemon" >&2
-        rm -f "$errfile"
-        "$ADB_BIN" start-server >/dev/null 2>&1 || true
-        sleep 1
+        # Non-zero exit: only retry if stderr clearly indicates adb-side trouble.
+        if echo "$err" | grep -qE "protocol fault|daemon not running|cannot connect to daemon|Connection reset"; then
+            echo "[harden] pidof attempt $attempt: adb daemon hiccup ($(echo "$err" | head -1)); restarting" >&2
+            "$ADB_BIN" start-server >/dev/null 2>&1 || true
+            sleep 1
+            continue
+        fi
+        # Otherwise treat as "process not running" (e.g. dialog intercepted launch).
+        printf ''
+        return 0
     done
     echo "[harden] pidof still failing after retry — adb daemon hosed" >&2
     return 1
@@ -46,14 +58,9 @@ step "wake + prox_close (idempotent)"
 $ADB shell input keyevent KEYCODE_WAKEUP || true
 $ADB shell am broadcast -a com.oculus.vrpowermanager.prox_close >/dev/null
 
-# Force-stop our app + clear logcat. We deliberately do NOT force-stop
-# com.oculus.vrshell anymore: with `setprop debug.oculus.skipProxBlanking 1`
-# (applied by dev.sh keep-awake-on / begin-automation), the controller-
-# required dialog doesn't fire, so the old vrshell-kill dance is unneeded
-# AND was actively harmful — it was tearing down the VR session and
-# putting the device into the perf-overlay-only state by the time
-# screencap fired. begin-automation now owns the device-state setup;
-# launch just brings our app to the front.
+# Force-stop our app + clear logcat. Device-state setup (controller-
+# required dialog suppression, keep-awake) is owned by `dev.sh
+# begin-automation`; this script only brings our app to the front.
 step "force-stop pkg + clear logcat"
 $ADB shell am force-stop "$PKG"
 $ADB logcat -c
